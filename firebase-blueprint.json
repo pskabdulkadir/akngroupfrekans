@@ -1,0 +1,401 @@
+{
+  "entities": {
+    "UserMember": {
+      "title": "UserMember",
+      "description": "User membership and admin approval state for AuraBio Frekans",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Unique user identifier"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User email address"
+        },
+        "fullName": {
+          "type": "string",
+          "description": "User full name"
+        },
+        "phone": {
+          "type": "string",
+          "description": "User contact phone / WhatsApp number"
+        },
+        "passwordHash": {
+          "type": "string",
+          "description": "Hashed or secured password identifier"
+        },
+        "isAllowed": {
+          "type": "boolean",
+          "description": "Boolean flag set by admin: true enables access, false locks application"
+        },
+        "expiryDate": {
+          "type": "string",
+          "description": "Expiration date in ISO format or null for unlimited"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when user registered"
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when user last logged in"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["member", "admin"],
+          "description": "User role"
+        },
+        "resellerId": {
+          "type": "string",
+          "description": "ID of the reseller / affiliate this user registered under"
+        },
+        "referredByCode": {
+          "type": "string",
+          "description": "Unique referral code used during registration"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Admin notes about the member"
+        }
+      },
+      "required": ["uid", "email", "fullName", "isAllowed", "createdAt"]
+    },
+    "Reseller": {
+      "title": "Reseller",
+      "description": "Affiliate and reseller partner profiles for AuraBio Frekans",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Unique reseller identifier"
+        },
+        "resellerName": {
+          "type": "string",
+          "description": "Business or partner full name"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Reseller email address"
+        },
+        "phone": {
+          "type": "string",
+          "description": "Reseller contact phone or WhatsApp"
+        },
+        "referralCode": {
+          "type": "string",
+          "description": "Unique invitation referral code (e.g. AURA-BAYI-5521)"
+        },
+        "commissionRate": {
+          "type": "number",
+          "description": "Commission percentage rate (e.g. 20 for 20%)"
+        },
+        "bankInfo": {
+          "type": "object",
+          "description": "Bank account details for payout transfers",
+          "properties": {
+            "bankName": { "type": "string" },
+            "accountHolder": { "type": "string" },
+            "iban": { "type": "string" }
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "pending", "suspended"],
+          "description": "Reseller account status"
+        },
+        "totalEarnings": {
+          "type": "number",
+          "description": "Total commission earned across all orders"
+        },
+        "paidEarnings": {
+          "type": "number",
+          "description": "Total commission paid out by admin"
+        },
+        "pendingEarnings": {
+          "type": "number",
+          "description": "Commission waiting for approval or payout"
+        },
+        "totalSalesAmount": {
+          "type": "number",
+          "description": "Total sales volume generated in TRY"
+        },
+        "totalReferredUsers": {
+          "type": "number",
+          "description": "Count of members registered with this referral code"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when reseller joined"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of last update"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Administrative notes"
+        }
+      },
+      "required": ["uid", "resellerName", "email", "referralCode", "createdAt"]
+    },
+    "CommissionTransaction": {
+      "title": "CommissionTransaction",
+      "description": "Affiliate commission and order transaction tracking with user privacy preservation",
+      "type": "object",
+      "properties": {
+        "transactionId": {
+          "type": "string",
+          "description": "Unique transaction ID"
+        },
+        "resellerId": {
+          "type": "string",
+          "description": "ID of the reseller who earns this commission"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Masked user ID who made the purchase (personal info hidden from reseller for privacy)"
+        },
+        "orderId": {
+          "type": "string",
+          "description": "Associated member order ID"
+        },
+        "packageName": {
+          "type": "string",
+          "description": "Purchased license or package name"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Total purchase / transaction amount in TRY"
+        },
+        "commissionRate": {
+          "type": "number",
+          "description": "Commission percentage rate applied"
+        },
+        "commissionAmount": {
+          "type": "number",
+          "description": "Earned commission amount in TRY"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "approved", "paid", "rejected"],
+          "description": "Commission approval and payout status"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when order and commission was generated"
+        },
+        "paidAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when admin paid out via bank transfer"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Transaction and payout notes"
+        }
+      },
+      "required": ["transactionId", "resellerId", "amount", "commissionAmount", "status", "createdAt"]
+    },
+    "JourneyProgress": {
+      "title": "JourneyProgress",
+      "description": "Progress tracking for 7-day holistic transformation journeys",
+      "type": "object",
+      "properties": {
+        "journeyId": {
+          "type": "string",
+          "description": "Unique identifier of the holistic journey program"
+        },
+        "userId": {
+          "type": "string",
+          "description": "User unique identifier"
+        },
+        "currentDay": {
+          "type": "number",
+          "description": "Current active day (1-7)"
+        },
+        "completedDays": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "List of completed day numbers"
+        },
+        "streak": {
+          "type": "number",
+          "description": "Consecutive days completed streak"
+        },
+        "completedSessions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "IDs of completed sessions (e.g. day1-morning)"
+        },
+        "lastCompletedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of the last completed session"
+        },
+        "isFinished": {
+          "type": "boolean",
+          "description": "Whether the 7-day program is fully finished"
+        }
+      },
+      "required": ["journeyId", "userId", "currentDay", "completedDays"]
+    },
+    "GlobalFrequencyPing": {
+      "title": "GlobalFrequencyPing",
+      "description": "Anonymous live collective peace frequency broadcast ping",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique ping ID"
+        },
+        "cityName": {
+          "type": "string",
+          "description": "City or Region name (e.g. Istanbul, London)"
+        },
+        "country": {
+          "type": "string",
+          "description": "Country name or ISO code"
+        },
+        "latitude": {
+          "type": "number",
+          "description": "Approximate latitude coordinate"
+        },
+        "longitude": {
+          "type": "number",
+          "description": "Approximate longitude coordinate"
+        },
+        "frequencyHz": {
+          "type": "number",
+          "description": "Active frequency in Hz (e.g. 528)"
+        },
+        "binauralHz": {
+          "type": "number",
+          "description": "Active binaural frequency in Hz"
+        },
+        "intention": {
+          "type": "string",
+          "description": "Meditation intention (e.g. Peace, Healing, Love)"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "Unix timestamp in milliseconds"
+        }
+      },
+      "required": ["cityName", "frequencyHz", "timestamp"]
+    },
+    "GroupAuraRoom": {
+      "title": "GroupAuraRoom",
+      "description": "Real-time collective family and enterprise group aura synchronization room",
+      "type": "object",
+      "properties": {
+        "roomId": {
+          "type": "string",
+          "description": "Unique room ID"
+        },
+        "roomCode": {
+          "type": "string",
+          "description": "Short 6-8 character invitation join code (e.g. AURA-7729)"
+        },
+        "roomName": {
+          "type": "string",
+          "description": "Display name of the group aura circle"
+        },
+        "description": {
+          "type": "string",
+          "description": "Purpose and intention of the group session"
+        },
+        "hostUid": {
+          "type": "string",
+          "description": "UID of the session host"
+        },
+        "hostName": {
+          "type": "string",
+          "description": "Display name of the session host"
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Timestamp when room was created"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Timestamp of last status update or frequency change"
+        },
+        "activeFrequencyHz": {
+          "type": "number",
+          "description": "Current active broadcast frequency in Hz"
+        },
+        "activeBinauralHz": {
+          "type": "number",
+          "description": "Current active binaural entrainment frequency in Hz"
+        },
+        "activeSessionTitle": {
+          "type": "string",
+          "description": "Title of the active group therapy session"
+        },
+        "isPlaying": {
+          "type": "boolean",
+          "description": "Whether the host has currently started acoustic playback for all devices"
+        },
+        "targetIntention": {
+          "type": "string",
+          "description": "Collective intention (e.g. Aile Huzuru & Korunma, Odaklanma)"
+        },
+        "memberCount": {
+          "type": "number",
+          "description": "Total count of active participants"
+        },
+        "coherenceScore": {
+          "type": "number",
+          "description": "Computed group resonance coherence score percentage (0-100)"
+        }
+      },
+      "required": ["roomId", "roomCode", "roomName", "hostUid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "UserMember"
+      },
+      "description": "Stores registered user accounts and their admin access approval status"
+    },
+    "/users/{userId}/journeyProgress/{journeyId}": {
+      "schema": {
+        "$ref": "JourneyProgress"
+      },
+      "description": "Stores user progress for specific 7-day transformation journeys"
+    },
+    "/globalHeatmapPings/{pingId}": {
+      "schema": {
+        "$ref": "GlobalFrequencyPing"
+      },
+      "description": "Stores anonymous live frequency resonance pings for the global peace heatmap"
+    },
+    "/groupAuraRooms/{roomId}": {
+      "schema": {
+        "$ref": "GroupAuraRoom"
+      },
+      "description": "Stores real-time collective sync rooms and active acoustic playback state"
+    },
+    "/resellers/{resellerId}": {
+      "schema": {
+        "$ref": "Reseller"
+      },
+      "description": "Stores reseller affiliate profiles, referral codes, commission rates, and bank information"
+    },
+    "/commissions/{transactionId}": {
+      "schema": {
+        "$ref": "CommissionTransaction"
+      },
+      "description": "Stores affiliate commissions, purchase transactions, and payout statuses with masked user privacy"
+    }
+  }
+}

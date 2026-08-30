@@ -1,0 +1,11 @@
+{
+  "name": "AuraBio Frekans",
+  "description": "Kuantum Biyo-Rezonans platformu: 3D Letaif ve Enerji Alanı (Aura) Simülasyon Motoru (Three.js), AI Yaşam Koçu & Günlük Frekans Günlüğü (Aura-Journal), Biyo-Ritim & Sirkadiyen Senkronizatörü, Sesli & Niyetli Frekans Labirenti, AI Bilinçaltı Çözümleyicisi, Kolektif Çember (Group Aura Sync), Optik kamera aura tespiti, Aura-Sync Akıllı Saat Köprüsü (BLE), AI Kutsal Geometri Mandala, Küresel Frekans Haritası, 50+ Kadim Şifa Rezonans Ansiklopedisi, 7 Çakra & 7 Letaif, Word/PDF raporlama.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
