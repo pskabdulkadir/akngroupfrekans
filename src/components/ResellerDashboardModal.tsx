@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Building2, 
   Wallet, 
@@ -68,7 +68,9 @@ import {
   subscribeToReseller, 
   getLocalResellers,
   getOrCreateResellerForUser,
-  getReferredUsersForReseller
+  getReferredUsersForReseller,
+  getSubResellersForReseller,
+  subscribeToResellersList
 } from '../utils/resellerManager';
 import { UserMember, BANK_INFO, ADMIN_PHONE } from '../utils/authManager';
 import { downloadTechnicalReportWord, downloadTechnicalReportPDF } from '../utils/technicalReportExport';
@@ -96,7 +98,7 @@ interface ResellerDashboardModalProps {
   onOpenAuthModal?: () => void;
   onOpenBusinessPresentation?: () => void;
   onOpenTechnicalReport?: () => void;
-  initialTab?: 'overview' | 'clients' | 'scans' | 'presentation' | 'packages' | 'share' | 'commissions' | 'invoices' | 'bank' | 'apply';
+  initialTab?: 'overview' | 'clients' | 'bayilerim' | 'scans' | 'presentation' | 'packages' | 'share' | 'commissions' | 'invoices' | 'bank' | 'apply';
 }
 
 export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
@@ -112,7 +114,7 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
   const [commissions, setCommissions] = useState<CommissionTransaction[]>([]);
   const [referredUsers, setReferredUsers] = useState<UserMember[]>([]);
   const [referredUserSearch, setReferredUserSearch] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<'overview' | 'clients' | 'scans' | 'presentation' | 'packages' | 'share' | 'commissions' | 'invoices' | 'bank' | 'apply'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'overview' | 'clients' | 'bayilerim' | 'scans' | 'presentation' | 'packages' | 'share' | 'commissions' | 'invoices' | 'bank' | 'apply'>(initialTab);
 
   // Dealer's own scan history state
   const [dealerScans, setDealerScans] = useState<ScanResult[]>([]);
@@ -121,6 +123,12 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
   const [isDeletingScanId, setIsDeletingScanId] = useState<string | null>(null);
   const [isClearingDealerScans, setIsClearingDealerScans] = useState<boolean>(false);
   const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
+
+  // Dealer's own sub-dealers (bayilerim) & their remaining credits
+  const [subResellers, setSubResellers] = useState<Reseller[]>([]);
+  const [subResellersLoading, setSubResellersLoading] = useState<boolean>(false);
+  const [subResellersSearch, setSubResellersSearch] = useState<string>('');
+  const subUidsRef = useRef<Set<string>>(new Set());
 
   // Digital Invoices State
   const [invoices, setInvoices] = useState<DigitalInvoice[]>([]);
@@ -409,6 +417,63 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
     } finally {
       setIsClearingDealerScans(false);
     }
+  };
+
+  // ---- Dealer's own sub-dealers (bayilerim) & live credit sync ----
+  const loadSubResellers = async (silent = false) => {
+    if (!activeReseller) return;
+    if (!silent) setSubResellersLoading(true);
+    try {
+      const list = await getSubResellersForReseller(activeReseller);
+      subUidsRef.current = new Set(list.map(r => r.uid));
+      setSubResellers(list);
+    } catch (e) {
+      console.debug('Load sub resellers notice:', e);
+    } finally {
+      if (!silent) setSubResellersLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isOpen || activeTab !== 'bayilerim' || !activeReseller) return;
+    let cancelled = false;
+    loadSubResellers();
+    const unsub = subscribeToResellersList(liveList => {
+      if (cancelled) return;
+      setSubResellers(prev => {
+        const parentUid = activeReseller.uid;
+        const code = (activeReseller.referralCode || '').trim().toUpperCase();
+        const qualifiers = subUidsRef.current;
+        if (prev.length === 0 && liveList.length === 0) return prev;
+        const merged = new Map(prev.map(r => [r.uid, r]));
+        let changed = false;
+        liveList.forEach(lr => {
+          const isMatch =
+            qualifiers.has(lr.uid) ||
+            (code && (lr.referredByCode || '').trim().toUpperCase() === code);
+          if (!isMatch || lr.uid === parentUid) return;
+          const current = merged.get(lr.uid);
+          if (!current || current.creditsBalance !== lr.creditsBalance || current.updatedAt !== lr.updatedAt) {
+            merged.set(lr.uid, lr);
+            changed = true;
+          }
+        });
+        if (!changed) return prev;
+        return Array.from(merged.values());
+      });
+    });
+    return () => {
+      cancelled = true;
+      unsub();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, activeTab, activeReseller?.uid, activeReseller?.referralCode]);
+
+  const creditColor = (c: number | undefined) => {
+    if (c === undefined) return 'text-slate-400';
+    if (c > 50) return 'text-emerald-300';
+    if (c >= 20) return 'text-amber-300';
+    return 'text-rose-300';
   };
 
   if (!isOpen) return null;
@@ -859,6 +924,21 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                 <span>Tarama Geçmişim</span>
                 <span className="px-1.5 py-0.2 bg-rose-950 text-rose-300 border border-rose-500/40 rounded-full text-[10px] font-mono font-bold">
                   {dealerScans.length}
+                </span>
+              </button>
+
+              <button
+                onClick={() => setActiveTab('bayilerim')}
+                className={`px-4 py-2 rounded-xl transition-all flex items-center gap-1.5 cursor-pointer ${
+                  activeTab === 'bayilerim'
+                    ? 'bg-gradient-to-r from-teal-600 to-emerald-600 text-white shadow-md'
+                    : 'text-teal-400 hover:text-teal-200 bg-teal-950/40 border border-teal-500/30'
+                }`}
+              >
+                <Users className="w-3.5 h-3.5" />
+                <span>Bayilerim & Kredi</span>
+                <span className="px-1.5 py-0.2 bg-teal-950 text-teal-300 border border-teal-500/40 rounded-full text-[10px] font-mono font-bold">
+                  {subResellers.length}
                 </span>
               </button>
 
@@ -1328,6 +1408,204 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
             )}
 
             {/* TAB: İŞ SUNUM RAPORU & DİJİTAL KATALOG */}
+            {activeTab === 'bayilerim' && (
+              <div className="space-y-6 animate-fade-in">
+                {/* Header Banner */}
+                <div className="p-5 rounded-3xl bg-gradient-to-r from-teal-950/80 via-slate-950 to-emerald-950/70 border border-teal-500/40 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <Users className="w-5 h-5 text-teal-400" />
+                      <h3 className="text-base font-extrabold text-slate-100">Bayilerim & Kredi Durumları</h3>
+                      <span className="px-2 py-0.5 rounded-full bg-teal-500/20 text-teal-300 border border-teal-500/40 text-[10px] font-bold font-mono">
+                        {activeReseller.referralCode}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-300 max-w-2xl leading-relaxed">
+                      Sizin davet kodunuzla (<strong className="text-teal-300">{activeReseller.referralCode}</strong>) bayilik başvurusu yapıp onaylanan tüm alt bayilerinizin seans kredi bakiyesi burada <strong className="text-emerald-300">anlık (canlı)</strong> olarak listelenir. Her tarama anında kredi bakiyesi otomatik güncellenir.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2 w-full md:w-auto shrink-0">
+                    <button
+                      onClick={() => loadSubResellers()}
+                      disabled={subResellersLoading}
+                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${subResellersLoading ? 'animate-spin' : ''}`} />
+                      <span>Yenile</span>
+                    </button>
+                    <span className="px-3 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-[10px] font-bold flex items-center gap-1.5">
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      CANLI SENKRONİZASYON
+                    </span>
+                  </div>
+                </div>
+
+                {/* Metrics Cards */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-1">
+                    <div className="flex items-center justify-between text-slate-400">
+                      <span className="text-xs font-medium">Toplam Alt Bayi</span>
+                      <Users className="w-4 h-4 text-teal-400" />
+                    </div>
+                    <div className="text-2xl font-bold text-slate-100 font-mono">
+                      {subResellers.length}
+                    </div>
+                    <div className="text-[10px] text-slate-500">
+                      Davet kodunuza bağlı bayiler
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-teal-950/30 border border-teal-500/30 space-y-1">
+                    <div className="flex items-center justify-between text-teal-300">
+                      <span className="text-xs font-medium">Toplam Kalan Kredi</span>
+                      <Coins className="w-4 h-4 text-teal-400" />
+                    </div>
+                    <div className="text-2xl font-bold text-teal-300 font-mono">
+                      {subResellers.reduce((t, r) => t + (typeof r.creditsBalance === 'number' ? r.creditsBalance : 0), 0).toLocaleString('tr-TR')}
+                    </div>
+                    <div className="text-[10px] text-teal-400/80">
+                      Tüm alt bayilerin seans kredi havuzu
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-slate-950/80 border border-amber-500/30 space-y-1">
+                    <div className="flex items-center justify-between text-amber-300">
+                      <span className="text-xs font-medium">Düşük / Yetersiz Kredi</span>
+                      <AlertCircle className="w-4 h-4 text-amber-400" />
+                    </div>
+                    <div className="text-2xl font-bold text-amber-300 font-mono">
+                      {subResellers.filter(r => (r.creditsBalance ?? 0) < 20).length}
+                    </div>
+                    <div className="text-[10px] text-amber-400/80">
+                      20 seansın altında kredisi olan bayiler
+                    </div>
+                  </div>
+                </div>
+
+                {/* Search */}
+                <div className="flex items-center gap-3 p-3 bg-slate-950/80 rounded-2xl border border-slate-800">
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      value={subResellersSearch}
+                      onChange={(e) => setSubResellersSearch(e.target.value)}
+                      placeholder="Bayi adı, e-posta veya referans kodu ara..."
+                      className="w-full pl-9 pr-4 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-slate-100 placeholder:text-slate-500 outline-none"
+                    />
+                    <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
+                  </div>
+                  <span className="text-xs text-slate-400 px-2 font-mono">
+                    {subResellers.filter(r => {
+                      if (!subResellersSearch.trim()) return true;
+                      const q = subResellersSearch.toLowerCase();
+                      return (
+                        (r.resellerName || r.fullName || '').toLowerCase().includes(q) ||
+                        (r.email || '').toLowerCase().includes(q) ||
+                        (r.referralCode || '').toLowerCase().includes(q)
+                      );
+                    }).length} Bayi Bulundu
+                  </span>
+                </div>
+
+                {/* Sub-dealers Table */}
+                {subResellersLoading && subResellers.length === 0 ? (
+                  <div className="flex items-center justify-center gap-3 p-10 text-slate-400 text-xs">
+                    <Loader2 className="w-4 h-4 animate-spin text-teal-400" />
+                    <span>Alt bayilerinizi listeliyoruz...</span>
+                  </div>
+                ) : subResellers.length === 0 ? (
+                  <div className="p-10 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-2xl">
+                    Henüz davet kodunuza bağlı bir alt bayi bulunmuyor. Davet linkinizi paylaştığınız ve bayilik onayı verilen üyeler otomatik olarak burada listelenir.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950/90">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-800 bg-slate-900/60 text-slate-400 font-semibold">
+                          <th className="py-3 px-4">Alt Bayi</th>
+                          <th className="py-3 px-4">Referans Kodu</th>
+                          <th className="py-3 px-4">Durum</th>
+                          <th className="py-3 px-4 text-right">Kalan Kredi</th>
+                          <th className="py-3 px-4 text-right">Toplam Tarama</th>
+                          <th className="py-3 px-4">Kayıt Tarihi</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60 text-slate-300">
+                        {subResellers
+                          .filter(r => {
+                            if (!subResellersSearch.trim()) return true;
+                            const q = subResellersSearch.toLowerCase();
+                            return (
+                              (r.resellerName || r.fullName || '').toLowerCase().includes(q) ||
+                              (r.email || '').toLowerCase().includes(q) ||
+                              (r.referralCode || '').toLowerCase().includes(q)
+                            );
+                          })
+                          .map(r => (
+                            <tr key={r.uid} className="hover:bg-slate-900/40 transition-colors">
+                              <td className="py-3.5 px-4">
+                                <div className="font-bold text-slate-100 flex items-center gap-2">
+                                  <span>{r.resellerName || r.fullName || 'Yetkili Bayi'}</span>
+                                </div>
+                                <div className="text-[11px] text-slate-500 mt-0.5">
+                                  {r.email || '-'}
+                                </div>
+                              </td>
+                              <td className="py-3.5 px-4">
+                                <span className="px-2 py-0.5 rounded-md bg-teal-500/15 border border-teal-500/30 text-teal-300 text-[10px] font-mono font-bold">
+                                  {r.referralCode || '-'}
+                                </span>
+                              </td>
+                              <td className="py-3.5 px-4">
+                                <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${
+                                  r.status === 'active'
+                                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                                    : r.status === 'pending'
+                                    ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                                    : 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+                                }`}>
+                                  {r.status === 'active' ? 'Aktif' : r.status === 'pending' ? 'Beklemede' : 'Askıda'}
+                                </span>
+                              </td>
+                              <td className="py-3.5 px-4 text-right">
+                                <div className="flex items-center justify-end gap-1.5">
+                                  <Coins className="w-3.5 h-3.5 text-teal-500" />
+                                  <span className={`text-sm font-extrabold font-mono ${creditColor(r.creditsBalance)}`}>
+                                    {r.creditsBalance ?? 0}
+                                  </span>
+                                  <span className="text-[10px] text-slate-500">seans</span>
+                                </div>
+                                {(r.creditsBalance ?? 0) < 20 && (
+                                  <div className="text-[10px] text-rose-400 mt-0.5">Kredi azalıyor - yükleme önerilir</div>
+                                )}
+                              </td>
+                              <td className="py-3.5 px-4 text-right font-mono text-[11px] text-slate-400">
+                                {r.totalScans ?? 0}
+                              </td>
+                              <td className="py-3.5 px-4 text-[11px] text-slate-500">
+                                {r.createdAt ? new Date(r.createdAt).toLocaleDateString('tr-TR', { day: '2-digit', month: 'short', year: 'numeric' }) : '-'}
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                    {subResellers.filter(r => {
+                      if (!subResellersSearch.trim()) return true;
+                      const q = subResellersSearch.toLowerCase();
+                      return (
+                        (r.resellerName || r.fullName || '').toLowerCase().includes(q) ||
+                        (r.email || '').toLowerCase().includes(q) ||
+                        (r.referralCode || '').toLowerCase().includes(q)
+                      );
+                    }).length === 0 && (
+                      <div className="p-6 text-center text-xs text-slate-500">Arama sonucu bulunamadı.</div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {activeTab === 'scans' && (
               <div className="space-y-4">
                 {/* Header + Actions */}

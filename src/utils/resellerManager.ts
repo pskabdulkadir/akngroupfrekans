@@ -2260,6 +2260,7 @@ export async function getOrCreateResellerForUser(user: UserMember): Promise<Rese
     email: (user.email || '').toLowerCase(),
     phone: user.dealerDetails?.whatsapp || user.phone || '05XX XXX XX XX',
     referralCode: finalCode,
+    referredByCode: (user.referredByCode || '').trim().toUpperCase(),
     commissionRate: user.dealerDetails?.commissionRate || 20,
     creditsBalance: user.creditsBalance !== undefined ? user.creditsBalance : 100,
     dealerPackageId: user.dealerPackageId || 'silver-dealer',
@@ -2395,6 +2396,55 @@ export async function getReferredUsersForReseller(
   }
 
   return result.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+}
+
+/**
+ * Get sub-dealers (bayiler) registered under a parent dealer.
+ * A sub-dealer is any reseller whose underlying member/user document
+ * was registered with the parent's referral code (or whose reseller
+ * doc already carries a persisted `referredByCode`).
+ */
+export async function getSubResellersForReseller(reseller: Reseller): Promise<Reseller[]> {
+  const parentUid = reseller?.uid || '';
+  const cleanCode = (reseller?.referralCode || '').trim().toUpperCase();
+  const subUids = new Set<string>();
+
+  // 1. Local members directory (offline-friendly)
+  try {
+    const { getLocalMembersDirectory } = await import('./authManager');
+    getLocalMembersDirectory().forEach(m => {
+      const byReseller = m.resellerId && m.resellerId === parentUid;
+      const byCode = cleanCode && (m.referredByCode || '').trim().toUpperCase() === cleanCode;
+      if ((byReseller || byCode) && m.uid && m.uid !== parentUid) {
+        subUids.add(m.uid);
+      }
+    });
+  } catch (e) {
+    console.debug('Get sub resellers local notice:', e);
+  }
+
+  // 2. Firestore users collection (members registered with the parent code)
+  try {
+    if (cleanCode) {
+      const usersCol = collection(db, 'users');
+      const snap = await getDocs(query(usersCol, where('referredByCode', '==', cleanCode)));
+      snap.forEach(docSnap => {
+        const uid = (docSnap.data() as UserMember)?.uid || docSnap.id;
+        if (uid && uid !== parentUid) subUids.add(uid);
+      });
+    }
+  } catch (fsErr) {
+    console.debug('Firestore get sub resellers notice:', fsErr);
+  }
+
+  // 3. Filter the reseller directory to the matched sub-dealers
+  const all = await getAllResellers();
+  return all
+    .filter(r =>
+      r.uid !== parentUid &&
+      (subUids.has(r.uid) || (cleanCode && (r.referredByCode || '').trim().toUpperCase() === cleanCode))
+    )
+    .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
 }
 
 /**
