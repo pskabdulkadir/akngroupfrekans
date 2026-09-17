@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Building2, 
   Wallet, 
@@ -69,7 +69,6 @@ import {
   getLocalResellers,
   getOrCreateResellerForUser,
   getReferredUsersForReseller,
-  getSubResellersForReseller,
   subscribeToResellersList
 } from '../utils/resellerManager';
 import { UserMember, BANK_INFO, ADMIN_PHONE } from '../utils/authManager';
@@ -124,11 +123,11 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
   const [isClearingDealerScans, setIsClearingDealerScans] = useState<boolean>(false);
   const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
 
-  // Dealer's own sub-dealers (bayilerim) & their remaining credits
+  // Bayilerim tab: referred members (danisanlar/uyeler) + their live remaining credits
   const [subResellers, setSubResellers] = useState<Reseller[]>([]);
   const [subResellersLoading, setSubResellersLoading] = useState<boolean>(false);
   const [subResellersSearch, setSubResellersSearch] = useState<string>('');
-  const subUidsRef = useRef<Set<string>>(new Set());
+  const [liveResellers, setLiveResellers] = useState<Reseller[]>([]);
 
   // Digital Invoices State
   const [invoices, setInvoices] = useState<DigitalInvoice[]>([]);
@@ -419,16 +418,15 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
     }
   };
 
-  // ---- Dealer's own sub-dealers (bayilerim) & live credit sync ----
-  const loadSubResellers = async (silent = false) => {
+  // ---- Bayilerim tab: referred members (danisanlar/uyeler) + live credit sync ----
+  const loadReferredUsersList = async (silent = false) => {
     if (!activeReseller) return;
     if (!silent) setSubResellersLoading(true);
     try {
-      const list = await getSubResellersForReseller(activeReseller);
-      subUidsRef.current = new Set(list.map(r => r.uid));
-      setSubResellers(list);
+      const data = await getReferredUsersForReseller(activeReseller.uid, activeReseller.referralCode);
+      setReferredUsers(data);
     } catch (e) {
-      console.debug('Load sub resellers notice:', e);
+      console.debug('Load referred users notice:', e);
     } finally {
       if (!silent) setSubResellersLoading(false);
     }
@@ -437,30 +435,9 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
   useEffect(() => {
     if (!isOpen || activeTab !== 'bayilerim' || !activeReseller) return;
     let cancelled = false;
-    loadSubResellers();
-    const unsub = subscribeToResellersList(liveList => {
-      if (cancelled) return;
-      setSubResellers(prev => {
-        const parentUid = activeReseller.uid;
-        const code = (activeReseller.referralCode || '').trim().toUpperCase();
-        const qualifiers = subUidsRef.current;
-        if (prev.length === 0 && liveList.length === 0) return prev;
-        const merged = new Map(prev.map(r => [r.uid, r]));
-        let changed = false;
-        liveList.forEach(lr => {
-          const isMatch =
-            qualifiers.has(lr.uid) ||
-            (code && (lr.referredByCode || '').trim().toUpperCase() === code);
-          if (!isMatch || lr.uid === parentUid) return;
-          const current = merged.get(lr.uid);
-          if (!current || current.creditsBalance !== lr.creditsBalance || current.updatedAt !== lr.updatedAt) {
-            merged.set(lr.uid, lr);
-            changed = true;
-          }
-        });
-        if (!changed) return prev;
-        return Array.from(merged.values());
-      });
+    loadReferredUsersList();
+    const unsub = subscribeToResellersList(list => {
+      if (!cancelled) setLiveResellers(list);
     });
     return () => {
       cancelled = true;
@@ -468,6 +445,40 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, activeTab, activeReseller?.uid, activeReseller?.referralCode]);
+
+  useEffect(() => {
+    if (!isOpen || activeTab !== 'bayilerim') return;
+    setSubResellersLoading(true);
+    const byUid = new Map<string, Reseller>();
+    liveResellers.forEach(r => { if (r.uid) byUid.set(r.uid, r); });
+    const merged = referredUsers.map(m => {
+      const live = m.uid ? byUid.get(m.uid) : undefined;
+      const statusRaw = live?.status || m.dealerStatus || (m.isApproved || m.isAllowed ? 'active' : 'active');
+      return {
+        uid: m.uid,
+        resellerName: m.fullName || live?.resellerName || 'Davet Edilen Üye',
+        fullName: m.fullName,
+        email: m.email || live?.email || '',
+        phone: m.phone || live?.phone || '',
+        referralCode: m.referralCode || live?.referralCode || '-',
+        commissionRate: live?.commissionRate ?? 20,
+        bankInfo: live?.bankInfo || { bankName: '', accountHolder: m.fullName || '', iban: '' },
+        status: statusRaw as Reseller['status'],
+        totalEarnings: live?.totalEarnings || 0,
+        paidEarnings: live?.paidEarnings || 0,
+        pendingEarnings: live?.pendingEarnings || 0,
+        totalSalesAmount: live?.totalSalesAmount || 0,
+        totalReferredUsers: live?.totalReferredUsers || 0,
+        creditsBalance: Number.isFinite(live?.creditsBalance) ? live!.creditsBalance! : (m.creditsBalance ?? 100),
+        totalScans: live?.totalScans || 0,
+        createdAt: m.createdAt || live?.createdAt || '',
+        updatedAt: live?.updatedAt || '',
+      } as Reseller;
+    });
+    setSubResellers(merged);
+    setSubResellersLoading(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, activeTab, referredUsers, liveResellers]);
 
   const creditColor = (c: number | undefined) => {
     if (c === undefined) return 'text-slate-400';
@@ -1421,13 +1432,13 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                       </span>
                     </div>
                     <p className="text-xs text-slate-300 max-w-2xl leading-relaxed">
-                      Sizin davet kodunuzla (<strong className="text-teal-300">{activeReseller.referralCode}</strong>) bayilik başvurusu yapıp onaylanan tüm alt bayilerinizin seans kredi bakiyesi burada <strong className="text-emerald-300">anlık (canlı)</strong> olarak listelenir. Her tarama anında kredi bakiyesi otomatik güncellenir.
+                      Sizin davet kodunuzla (<strong className="text-teal-300">{activeReseller.referralCode}</strong>) kayıt olan tüm danışanlarınız ve üyeleriniz ile onların seans kredi bakiyeleri burada <strong className="text-emerald-300">anlık (canlı)</strong> olarak listelenir. Her tarama anında kredi bakiyesi otomatik güncellenir.
                     </p>
                   </div>
 
                   <div className="flex items-center gap-2 w-full md:w-auto shrink-0">
                     <button
-                      onClick={() => loadSubResellers()}
+                      onClick={() => loadReferredUsersList()}
                       disabled={subResellersLoading}
                       className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
                     >
@@ -1445,14 +1456,14 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                   <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-1">
                     <div className="flex items-center justify-between text-slate-400">
-                      <span className="text-xs font-medium">Toplam Alt Bayi</span>
+                      <span className="text-xs font-medium">Toplam Danışan / Üye</span>
                       <Users className="w-4 h-4 text-teal-400" />
                     </div>
                     <div className="text-2xl font-bold text-slate-100 font-mono">
                       {subResellers.length}
                     </div>
                     <div className="text-[10px] text-slate-500">
-                      Davet kodunuza bağlı bayiler
+                      Davet kodunuza bağlı üyeler
                     </div>
                   </div>
 
@@ -1465,7 +1476,7 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                       {subResellers.reduce((t, r) => t + (typeof r.creditsBalance === 'number' ? r.creditsBalance : 0), 0).toLocaleString('tr-TR')}
                     </div>
                     <div className="text-[10px] text-teal-400/80">
-                      Tüm alt bayilerin seans kredi havuzu
+                      Tüm danışanlarınızın seans kredi havuzu
                     </div>
                   </div>
 
@@ -1478,7 +1489,7 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                       {subResellers.filter(r => (r.creditsBalance ?? 0) < 20).length}
                     </div>
                     <div className="text-[10px] text-amber-400/80">
-                      20 seansın altında kredisi olan bayiler
+                      20 seansın altında kredisi olan üyeler
                     </div>
                   </div>
                 </div>
@@ -1490,7 +1501,7 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                       type="text"
                       value={subResellersSearch}
                       onChange={(e) => setSubResellersSearch(e.target.value)}
-                      placeholder="Bayi adı, e-posta veya referans kodu ara..."
+                      placeholder="Danışan adı, e-posta veya referans kodu ara..."
                       className="w-full pl-9 pr-4 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-slate-100 placeholder:text-slate-500 outline-none"
                     />
                     <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
@@ -1504,7 +1515,7 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                         (r.email || '').toLowerCase().includes(q) ||
                         (r.referralCode || '').toLowerCase().includes(q)
                       );
-                    }).length} Bayi Bulundu
+                    }).length} Danışan Bulundu
                   </span>
                 </div>
 
@@ -1516,14 +1527,14 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                   </div>
                 ) : subResellers.length === 0 ? (
                   <div className="p-10 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-2xl">
-                    Henüz davet kodunuza bağlı bir alt bayi bulunmuyor. Davet linkinizi paylaştığınız ve bayilik onayı verilen üyeler otomatik olarak burada listelenir.
+                    Henüz davet kodunuza bağlı bir danışan / üye bulunmuyor. Davet linkinizi paylaştığınız üyeler otomatik olarak burada listelenir.
                   </div>
                 ) : (
                   <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950/90">
                     <table className="w-full text-left text-xs">
                       <thead>
                         <tr className="border-b border-slate-800 bg-slate-900/60 text-slate-400 font-semibold">
-                          <th className="py-3 px-4">Alt Bayi</th>
+                          <th className="py-3 px-4">Danışan / Üye</th>
                           <th className="py-3 px-4">Referans Kodu</th>
                           <th className="py-3 px-4">Durum</th>
                           <th className="py-3 px-4 text-right">Kalan Kredi</th>
@@ -1559,13 +1570,13 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                               </td>
                               <td className="py-3.5 px-4">
                                 <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${
-                                  r.status === 'active'
-                                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
-                                    : r.status === 'pending'
+                                  r.status === 'pending'
                                     ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
-                                    : 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+                                    : ['suspended', 'rejected'].includes(String(r.status))
+                                    ? 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+                                    : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
                                 }`}>
-                                  {r.status === 'active' ? 'Aktif' : r.status === 'pending' ? 'Beklemede' : 'Askıda'}
+                                  {r.status === 'pending' ? 'Beklemede' : ['suspended', 'rejected'].includes(String(r.status)) ? 'Askıda' : 'Aktif'}
                                 </span>
                               </td>
                               <td className="py-3.5 px-4 text-right">
