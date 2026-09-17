@@ -39,8 +39,12 @@ import {
 import { 
   Reseller, 
   CommissionTransaction, 
+  CreditTransaction,
   getReferredUsersForReseller, 
   getCommissionsForReseller,
+  getCreditLogsForReseller,
+  subscribeToReseller,
+  subscribeToResellerCreditLogs,
   adminSaveReseller,
   adminUpdateCommissionStatus,
   adminAdjustDealerCredits,
@@ -85,6 +89,8 @@ export const ResellerDetailModal: React.FC<ResellerDetailModalProps> = ({
   const [commissions, setCommissions] = useState<CommissionTransaction[]>([]);
   const [dealerOrders, setDealerOrders] = useState<DealerPackageOrder[]>([]);
   const [associatedMember, setAssociatedMember] = useState<UserMember | null>(null);
+  const [creditLogs, setCreditLogs] = useState<CreditTransaction[]>([]);
+  const [isLiveSynced, setIsLiveSynced] = useState<boolean>(false);
 
   // Loading states
   const [isLoadingData, setIsLoadingData] = useState(true);
@@ -145,6 +151,53 @@ export const ResellerDetailModal: React.FC<ResellerDetailModalProps> = ({
     setIbanInput(reseller.bankInfo?.iban || '');
     loadDeepData();
   }, [reseller]);
+
+  // LIVE SYNC: Real-time Firestore listener for this dealer's balance, scan stats and audit trail.
+  // The admin screen updates instantly whenever the dealer scans on any device (no manual refresh).
+  useEffect(() => {
+    if (!reseller?.uid) return;
+
+    let isActive = true;
+    setIsLiveSynced(false);
+
+    // Initial offline-friendly fetch of the dealer's credit history
+    getCreditLogsForReseller(reseller.uid)
+      .then(logs => { if (isActive) setCreditLogs(logs); })
+      .catch(() => {});
+
+    const unsubReseller = subscribeToReseller(reseller.uid, (updated) => {
+      if (!isActive || !updated) return;
+      setCurrentReseller(prev => prev ? {
+        ...prev,
+        creditsBalance: typeof updated.creditsBalance === 'number' ? updated.creditsBalance : prev.creditsBalance,
+        totalScans: typeof updated.totalScans === 'number' ? updated.totalScans : prev.totalScans,
+        lastScanAt: updated.lastScanAt || prev.lastScanAt,
+        status: updated.status || prev.status,
+        updatedAt: updated.updatedAt || prev.updatedAt
+      } : { ...updated });
+      setIsLiveSynced(true);
+    });
+
+    const unsubLogs = subscribeToResellerCreditLogs(reseller.uid, (logs) => {
+      if (isActive) setCreditLogs(logs);
+    });
+
+    // Keep local audit mirror consistent with realtime source
+    const handleLogsUpdated = () => {
+      if (!isActive) return;
+      getCreditLogsForReseller(reseller.uid)
+        .then(logs => { if (isActive) setCreditLogs(logs); })
+        .catch(() => {});
+    };
+    window.addEventListener('aurabio_credit_logs_updated', handleLogsUpdated);
+
+    return () => {
+      isActive = false;
+      unsubReseller();
+      unsubLogs();
+      window.removeEventListener('aurabio_credit_logs_updated', handleLogsUpdated);
+    };
+  }, [reseller?.uid]);
 
   const showSuccessNotification = (msg: string) => {
     setActionSuccessMsg(msg);
@@ -472,6 +525,12 @@ export const ResellerDetailModal: React.FC<ResellerDetailModalProps> = ({
           <div className="space-y-6">
             
             {/* Quick Metrics Cards */}
+            <div className="flex items-center justify-end">
+              <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold border flex items-center gap-1.5 ${isLiveSynced ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${isLiveSynced ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`} />
+                {isLiveSynced ? 'CANLI SENKRONİZASYON' : 'Yükleniyor...'}
+              </span>
+            </div>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-1">
                 <span className="text-[11px] text-slate-400 font-medium block">Kalan Seans Kredisi</span>
@@ -482,19 +541,21 @@ export const ResellerDetailModal: React.FC<ResellerDetailModalProps> = ({
               </div>
 
               <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-1">
+                <span className="text-[11px] text-slate-400 font-medium block">Toplam Yapılan Tarama</span>
+                <div className="text-xl font-black font-mono text-rose-300">
+                  {currentReseller.totalScans ?? creditLogs.filter(l => l.type === 'scan_usage').length} Tarama
+                </div>
+                <span className="text-[10px] text-slate-500 block">
+                  {currentReseller.lastScanAt ? `Son: ${new Date(currentReseller.lastScanAt).toLocaleString('tr-TR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}` : 'Henüz Tarama Yok'}
+                </span>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-1">
                 <span className="text-[11px] text-slate-400 font-medium block">Komisyon Oranı</span>
                 <div className="text-xl font-black font-mono text-teal-300">
                   %{currentReseller.commissionRate || 20}
                 </div>
                 <span className="text-[10px] text-slate-500 block">Danışan Satış Payı</span>
-              </div>
-
-              <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-1">
-                <span className="text-[11px] text-slate-400 font-medium block">Toplam Ciro</span>
-                <div className="text-xl font-black font-mono text-slate-100">
-                  {totalSales.toLocaleString('tr-TR')} ₺
-                </div>
-                <span className="text-[10px] text-slate-500 block">Referans Hacmi</span>
               </div>
 
               <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-1">
@@ -717,6 +778,101 @@ export const ResellerDetailModal: React.FC<ResellerDetailModalProps> = ({
                   </button>
                 </div>
               </div>
+            </div>
+
+            {/* LIVE BIYO-REZONANS HAREKET GECMISI (DENETIM YOLU) */}
+            <div className="p-5 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-4">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2 text-emerald-400 font-bold text-xs uppercase tracking-wider">
+                  <Activity className="w-4 h-4" />
+                  <span>Kredi Hareket Geçmişi (Denetim Yolu)</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold border flex items-center gap-1.5 ${isLiveSynced ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${isLiveSynced ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`} />
+                    {isLiveSynced ? 'CANLI' : 'Yükleniyor'}
+                  </span>
+                  <span className="px-3 py-1 rounded-xl bg-slate-900 border border-slate-700 text-xs font-bold text-slate-200">
+                    Toplam: {creditLogs.length} Hareket
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 text-[11px] text-slate-400 bg-slate-900/70 border border-slate-800 rounded-xl px-3 py-2">
+                <Clock className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                <span>
+                  Bayi seans taraması tamamlandığı anda bu liste <strong className="text-emerald-300">anlık (real-time)</strong> güncellenir. Her satır; hangi tarih/saatte, hangi tarama/işlem için kaç kredi kullanıldığını gösterir.
+                </span>
+              </div>
+
+              {creditLogs.length === 0 ? (
+                <div className="p-6 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-2xl">
+                  Henüz kredi hareketi kaydedilmemiş. Bayi tarama yaptıkça işlem geçmişi burada anlık olarak görünecektir.
+                </div>
+              ) : (
+                <div className="overflow-x-auto rounded-2xl border border-slate-800 max-h-80 overflow-y-auto">
+                  <table className="w-full text-left text-xs text-slate-300">
+                    <thead className="bg-slate-900/90 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800 sticky top-0">
+                      <tr>
+                        <th className="p-3">Tarih / Saat</th>
+                        <th className="p-3">İşlem Türü</th>
+                        <th className="p-3 text-center">Kredi Değişimi</th>
+                        <th className="p-3 text-center">Bakiye</th>
+                        <th className="p-3">Açıklama</th>
+                        <th className="p-3 text-right">Kaynak</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800 font-mono">
+                      {creditLogs.map(log => {
+                        const isPositive = log.amount > 0;
+                        const isZero = log.amount === 0;
+                        return (
+                          <tr key={log.id} className="hover:bg-slate-900/60 transition-colors">
+                            <td className="p-3 font-sans text-[11px] text-slate-400 whitespace-nowrap">
+                              {log.createdAt ? new Date(log.createdAt).toLocaleString('tr-TR', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '-'}
+                            </td>
+                            <td className="p-3 font-sans">
+                              <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${
+                                log.type === 'scan_usage'
+                                  ? 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+                                  : log.type === 'purchase' || log.type === 'admin_add' || log.type === 'bonus' || log.type === 'initial'
+                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                                  : log.type === 'admin_set'
+                                  ? 'bg-purple-500/20 text-purple-300 border-purple-500/30'
+                                  : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                              }`}>
+                                {log.type === 'scan_usage' ? 'Tarama (-)' :
+                                 log.type === 'purchase' ? 'Paket (+) ' :
+                                 log.type === 'admin_add' ? 'Admin Yükleme (+)' :
+                                 log.type === 'admin_deduct' ? 'Admin Düşüm (-)' :
+                                 log.type === 'admin_set' ? 'Bakiye Sabitleme (=)' :
+                                 log.type === 'bonus' ? 'Bonus (+)' :
+                                 'Başlangıç'}
+                              </span>
+                            </td>
+                            <td className="p-3 text-center font-bold text-sm">
+                              <span className={isPositive ? 'text-emerald-400' : isZero ? 'text-slate-400' : 'text-rose-400'}>
+                                {isPositive ? `+${log.amount}` : log.amount}
+                              </span>
+                            </td>
+                            <td className="p-3 text-center text-[11px]">
+                              <span className="text-slate-500">{log.previousBalance}</span>
+                              <span className="text-slate-600 mx-1">➔</span>
+                              <span className="font-bold text-slate-100">{log.newBalance}</span>
+                            </td>
+                            <td className="p-3 font-sans text-[11px] text-slate-300 max-w-xs">
+                              {log.description}
+                            </td>
+                            <td className="p-3 text-right font-sans text-[10px] text-slate-400">
+                              {log.performedBy || '-'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
 
             {/* Financial Overview Grid & Commission Setting */}

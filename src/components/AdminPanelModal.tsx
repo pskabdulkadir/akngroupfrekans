@@ -104,6 +104,8 @@ import {
   adminSetDealerCredits,
   getAllCreditLogsAdmin,
   getCreditLogsForReseller,
+  subscribeToResellersList,
+  subscribeToCreditLogs,
   CreditTransaction
 } from '../utils/resellerManager';
 import { 
@@ -119,7 +121,7 @@ import {
   DEFAULT_ISSUER_INFO,
   numberToTurkishWords
 } from '../utils/invoiceManager';
-import { DealerDetails } from '../types';
+import { DealerDetails, ScanResult } from '../types';
 import { ResellerDetailModal } from './ResellerDetailModal';
 import { DigitalInvoiceModal } from './DigitalInvoiceModal';
 import { CampaignsManagerAdminTab } from './CampaignsManagerAdminTab';
@@ -127,6 +129,13 @@ import {
   downloadInvoicePDF, 
   shareInvoiceViaWhatsAppWithPDF 
 } from '../utils/invoicePdfExporter';
+import { 
+  getAllScanRecordsAdmin,
+  deleteScanResult,
+  deleteScanRecordsByIds,
+  clearAllScanRecords,
+  subscribeToScanRecords
+} from '../utils/storage';
 
 interface AdminPanelModalProps {
   onClose: () => void;
@@ -143,7 +152,16 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   const [loginError, setLoginError] = useState<boolean>(false);
 
   // Active Admin Subtab
-  const [adminTab, setAdminTab] = useState<'members' | 'packages' | 'resellers' | 'dealers' | 'devices' | 'invoices' | 'campaigns'>('members');
+  const [adminTab, setAdminTab] = useState<'members' | 'packages' | 'resellers' | 'dealers' | 'devices' | 'invoices' | 'campaigns' | 'scans'>('members');
+
+// Scan Records (Seans Geçmişi) Management State
+const [scanRecords, setScanRecords] = useState<ScanResult[]>([]);
+const [scanRecordsLoading, setScanRecordsLoading] = useState<boolean>(false);
+const [scanRecordsSearch, setScanRecordsSearch] = useState<string>('');
+const [selectedScanIds, setSelectedScanIds] = useState<Set<string>>(new Set());
+const [isBulkDeletingScans, setIsBulkDeletingScans] = useState<boolean>(false);
+const [isClearingAllScans, setIsClearingAllScans] = useState<boolean>(false);
+const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
 
   // Digital Invoices Management State
   const [invoices, setInvoices] = useState<DigitalInvoice[]>(getLocalDigitalInvoices);
@@ -439,11 +457,46 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
     const unsubInvoices = subscribeToDigitalInvoices((list) => {
       setInvoices(list);
     });
+    // LIVE SYNC: Dealers list + credit audit trail — the admin grid and credit history
+    // update instantly (onSnapshot) whenever a dealer scans or credits are adjusted.
+    const unsubResellers = subscribeToResellersList((liveList) => {
+      setResellers(prev => {
+        // Merge live Firestore snapshot onto existing (member-merged) list so no data is lost
+        const map = new Map<string, Reseller>(prev.map(r => [r.uid, r]));
+        return liveList.map(live => {
+          const existing = map.get(live.uid);
+          return existing ? { ...existing, ...live, uid: live.uid } : live;
+        });
+      });
+    });
+    const unsubCreditLogs = subscribeToCreditLogs((liveLogs) => {
+      setCreditLogs(prev => {
+        const map = new Map<string, CreditTransaction>(liveLogs.map(l => [l.id, l]));
+        prev.forEach(l => { if (!map.has(l.id)) map.set(l.id, l); });
+        return Array.from(map.values()).sort(
+          (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+        );
+      });
+    });
+    // LIVE SYNC: full scan history — new scans appear instantly in the admin history tab
+    const unsubScans = subscribeToScanRecords((list) => {
+      setScanRecords(prev => {
+        const map = new Map<string, ScanResult>(list.map(s => [s.id, s]));
+        prev.forEach(s => { if (!map.has(s.id)) map.set(s.id, s); });
+        return Array.from(map.values()).sort(
+          (a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime()
+        );
+      });
+      setSelectedScanIds(prev => new Set([...Array.from(prev)].filter(id => list.some(s => s.id === id))));
+    });
     return () => {
       unsub();
       unsubDp();
       unsubOrders();
       unsubInvoices();
+      unsubResellers();
+      unsubCreditLogs();
+      unsubScans();
     };
   }, []);
 
@@ -510,6 +563,86 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
 
   const handleDeleteInvoice = (inv: DigitalInvoice) => {
     setInvoiceToDelete(inv);
+  };
+
+  // ---- Scan Records (Seans Geçmişi) Handlers ----
+  const loadScanRecords = async (silent = false) => {
+    if (!silent) setScanRecordsLoading(true);
+    try {
+      const list = await getAllScanRecordsAdmin();
+      setScanRecords(list);
+      setSelectedScanIds(prev => new Set([...Array.from(prev)].filter(id => list.some(s => s.id === id))));
+    } catch (e) {
+      console.error('Load scan records error:', e);
+    } finally {
+      if (!silent) setScanRecordsLoading(false);
+    }
+  };
+
+  const handleDeleteSingleScan = (id: string) => {
+    deleteScanResult(id, 'global');
+    setScanRecords(prev => prev.filter(s => s.id !== id));
+    setSelectedScanIds(prev => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    setScanActionMsg('Tarama kaydı kalıcı olarak silindi.');
+    setTimeout(() => setScanActionMsg(null), 3000);
+  };
+
+  const toggleScanSelection = (id: string) => {
+    setSelectedScanIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllScans = () => {
+    setSelectedScanIds(prev => prev.size === scanRecords.length && scanRecords.length > 0
+      ? new Set()
+      : new Set(scanRecords.map(s => s.id)));
+  };
+
+  const handleBulkDeleteSelectedScans = async () => {
+    const ids = Array.from(selectedScanIds);
+    if (ids.length === 0) return;
+    const ok = window.confirm(`${ids.length} adet tarama kaydı kalıcı olarak silinecek. Bu işlem geri alınamaz. Emin misiniz?`);
+    if (!ok) return;
+    setIsBulkDeletingScans(true);
+    try {
+      await deleteScanRecordsByIds(ids, 'global');
+      setScanRecords(prev => prev.filter(s => !ids.includes(s.id)));
+      setSelectedScanIds(new Set());
+      setScanActionMsg(`${ids.length} adet tarama kaydı başarıyla silindi.`);
+      setTimeout(() => setScanActionMsg(null), 3500);
+    } catch (e) {
+      console.error('Bulk delete scans error:', e);
+      alert('Tarama kayıtları silinirken bir hata oluştu.');
+    } finally {
+      setIsBulkDeletingScans(false);
+    }
+  };
+
+  const handleClearAllScans = async () => {
+    if (scanRecords.length === 0) return;
+    const ok = window.confirm(`TÜM tarama kayıtları (${scanRecords.length} adet) Firestore veritabanından kalıcı olarak silinecek. Bu işlem geri alınamaz! Emin misiniz?`);
+    if (!ok) return;
+    setIsClearingAllScans(true);
+    try {
+      const deleted = await clearAllScanRecords();
+      setScanRecords([]);
+      setSelectedScanIds(new Set());
+      setScanActionMsg(`${deleted} adet tarama kaydı başarıyla temizlendi.`);
+      setTimeout(() => setScanActionMsg(null), 4000);
+    } catch (e) {
+      console.error('Clear all scans error:', e);
+      alert('Tarama kayıtları temizlenirken bir hata oluştu.');
+    } finally {
+      setIsClearingAllScans(false);
+    }
   };
 
   const handleOpenCreateCustomInvoice = () => {
@@ -1454,6 +1587,21 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
               >
                 <Gift className="w-4 h-4 text-amber-400" />
                 <span>Kampanyalar & Fırsatlar</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setAdminTab('scans');
+                  loadScanRecords(true);
+                }}
+                className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 cursor-pointer ${
+                  adminTab === 'scans'
+                    ? 'bg-gradient-to-r from-rose-600/30 via-red-600/30 to-rose-600/30 text-rose-300 border border-rose-500/50 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                }`}
+              >
+                <Clock className="w-4 h-4 text-rose-400" />
+                <span>Tarama Kayıtları ({scanRecords.length})</span>
               </button>
             </div>
 
@@ -4109,6 +4257,192 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
               <CampaignsManagerAdminTab
                 onSuccessMessage={(msg) => setActionSuccessMsg(msg)}
               />
+            )}
+
+            {adminTab === 'scans' && (
+              <div className="space-y-4">
+                {/* Header + Actions */}
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-11 h-11 rounded-2xl bg-rose-500/20 border border-rose-500/50 text-rose-400 flex items-center justify-center shrink-0 shadow-lg shadow-rose-950/60">
+                      <Clock className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-extrabold text-slate-100 uppercase tracking-wider">Tarama Kayıtları (Seans Geçmişi)</h3>
+                      <p className="text-[11px] text-slate-400">
+                        Tüm bayiler ve danışanlara ait canlı tarama kayıtları. Silme işlemi Firestore veritabanından kalıcı olarak kaldırır.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={() => loadScanRecords(true)}
+                      disabled={scanRecordsLoading}
+                      className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                      title="Tarama kayıtlarını yenile"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${scanRecordsLoading ? 'animate-spin' : ''}`} />
+                      <span>Canlı Liste</span>
+                    </button>
+
+                    <button
+                      onClick={handleBulkDeleteSelectedScans}
+                      disabled={selectedScanIds.size === 0 || isBulkDeletingScans}
+                      className={`px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                        selectedScanIds.size > 0
+                          ? 'bg-orange-600/80 hover:bg-orange-600 text-white shadow-md shadow-orange-950/60'
+                          : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      }`}
+                    >
+                      {isBulkDeletingScans ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                      <span>Seçilileri Sil ({selectedScanIds.size})</span>
+                    </button>
+
+                    <button
+                      onClick={handleClearAllScans}
+                      disabled={scanRecords.length === 0 || isClearingAllScans}
+                      className={`px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                        scanRecords.length > 0
+                          ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-md shadow-rose-950/60'
+                          : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      }`}
+                    >
+                      {isClearingAllScans ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <AlertTriangle className="w-3.5 h-3.5" />}
+                      <span>Tümünü Sil ({scanRecords.length})</span>
+                    </button>
+                  </div>
+                </div>
+
+                {scanActionMsg && (
+                  <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold">
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span>{scanActionMsg}</span>
+                  </div>
+                )}
+
+                {/* Search + Select All */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative flex-1 min-w-[220px]">
+                    <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-2.5" />
+                    <input
+                      type="text"
+                      value={scanRecordsSearch}
+                      onChange={(e) => setScanRecordsSearch(e.target.value)}
+                      placeholder="Danışan adı, e-posta, tarama tipi veya ID ile ara..."
+                      className="w-full pl-9 pr-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs text-slate-200 outline-none focus:border-rose-500 placeholder:text-slate-600"
+                    />
+                  </div>
+                  <button
+                    onClick={toggleSelectAllScans}
+                    disabled={scanRecords.length === 0}
+                    className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Check className={`w-3.5 h-3.5 ${selectedScanIds.size === scanRecords.length && scanRecords.length > 0 ? 'text-emerald-400' : ''}`} />
+                    <span>{selectedScanIds.size === scanRecords.length && scanRecords.length > 0 ? 'Seçimi Kaldır' : 'Tümünü Seç'}</span>
+                  </button>
+                </div>
+
+                {/* Records table */}
+                {scanRecordsLoading && scanRecords.length === 0 ? (
+                  <div className="flex items-center justify-center gap-3 p-10 text-slate-400 text-xs">
+                    <Loader2 className="w-4 h-4 animate-spin text-rose-400" />
+                    <span>Tarama kayıtları yükleniyor...</span>
+                  </div>
+                ) : scanRecords.length === 0 ? (
+                  <div className="p-10 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-2xl">
+                    Henüz hiç tarama kaydı bulunmuyor. Bayiler tarama yaptıkça kayıtlar burada anlık olarak görünecektir.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-2xl border border-slate-800">
+                    <table className="w-full text-left text-xs text-slate-300">
+                      <thead className="bg-slate-900/90 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800 sticky top-0">
+                        <tr>
+                          <th className="p-3 w-8">
+                            <input
+                              type="checkbox"
+                              checked={selectedScanIds.size === scanRecords.length && scanRecords.length > 0}
+                              onChange={toggleSelectAllScans}
+                              className="accent-rose-500 cursor-pointer"
+                            />
+                          </th>
+                          <th className="p-3">Tarih / Saat</th>
+                          <th className="p-3">Danışan</th>
+                          <th className="p-3">Tarama Türü</th>
+                          <th className="p-3">Frekans</th>
+                          <th className="p-3">Durum</th>
+                          <th className="p-3 text-right">İşlem</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800">
+                        {scanRecords
+                          .filter(s => {
+                            const q = scanRecordsSearch.trim().toLowerCase();
+                            if (!q) return true;
+                            return (
+                              (s.userName || '').toLowerCase().includes(q) ||
+                              (s.userEmail || '').toLowerCase().includes(q) ||
+                              (s.userUid || s.userId || '').toLowerCase().includes(q) ||
+                              (s.id || '').toLowerCase().includes(q) ||
+                              ((s.treatmentName || s.targetName || s.targetType || '') as string).toLowerCase().includes(q)
+                            );
+                          })
+                          .map(s => {
+                            const isSelected = selectedScanIds.has(s.id);
+                            return (
+                              <tr key={s.id} className={`hover:bg-slate-900/60 transition-colors ${isSelected ? 'bg-rose-900/10' : ''}`}>
+                                <td className="p-3">
+                                  <input
+                                    type="checkbox"
+                                    checked={isSelected}
+                                    onChange={() => toggleScanSelection(s.id)}
+                                    className="accent-rose-500 cursor-pointer"
+                                  />
+                                </td>
+                                <td className="p-3 text-[11px] text-slate-400 whitespace-nowrap font-mono">
+                                  {s.timestamp ? new Date(s.timestamp).toLocaleString('tr-TR', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '-'}
+                                </td>
+                                <td className="p-3">
+                                  <div className="font-bold text-slate-100">{s.userName || 'Misafir Danışan'}</div>
+                                  {s.userEmail && <div className="text-[10px] text-slate-500">{s.userEmail}</div>}
+                                  <div className="font-mono text-[9px] text-slate-600">{s.userUid || s.userId || ''}</div>
+                                </td>
+                                <td className="p-3">
+                                  <span className="px-2 py-0.5 rounded-md text-[10px] font-bold border bg-cyan-500/20 text-cyan-300 border-cyan-500/30">
+                                    {(s.treatmentName || s.targetName || s.targetType || 'Biyo-Aura Tarama')}
+                                  </span>
+                                </td>
+                                <td className="p-3 font-mono text-[11px] text-amber-300">
+                                  {s.frequencyHz ? `${s.frequencyHz} Hz` : '-'}
+                                </td>
+                                <td className="p-3">
+                                  <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${s.isAfterTreatment ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-cyan-600/20 text-cyan-300 border-cyan-500/30'}`}>
+                                    {s.isAfterTreatment ? 'Tedavi Sonrası' : s.treatmentName ? 'Seans Kaydı' : 'Tarama'}
+                                  </span>
+                                </td>
+                                <td className="p-3 text-right">
+                                  <button
+                                    onClick={() => handleDeleteSingleScan(s.id)}
+                                    className="p-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/30 text-rose-400 hover:text-rose-200 transition-colors cursor-pointer"
+                                    title="Bu tarama kaydını sil"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                    {scanRecords.filter(s => {
+                      const q = scanRecordsSearch.trim().toLowerCase();
+                      return !q || (s.userName || '').toLowerCase().includes(q) || (s.userEmail || '').toLowerCase().includes(q) || (s.userUid || s.userId || '').toLowerCase().includes(q) || (s.id || '').toLowerCase().includes(q) || ((s.treatmentName || s.targetName || s.targetType || '') as string).toLowerCase().includes(q);
+                    }).length === 0 && (
+                      <div className="p-6 text-center text-xs text-slate-500">Arama sonucu bulunamadı.</div>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
 
           </div>

@@ -687,7 +687,11 @@ export default function App() {
     setScanHistory((prev) => [result, ...prev.filter(s => s.id !== result.id)]);
 
     // Deduct credit from Dealer/Reseller credit pool in real-time
-    deductScanCreditFromDealer(currentUser?.uid).then((res) => {
+    // (Atomic Firestore transaction + unique requestId prevents double-spend on double triggers)
+    deductScanCreditFromDealer(currentUser?.uid, {
+      scanCost: 1,
+      requestId: result?.id || `SCAN-${Date.now()}`
+    }).then((res) => {
       if (res.success && typeof res.remainingCredits === 'number') {
         if (currentUser) {
           setCurrentUser((prev) => prev ? { ...prev, creditsBalance: res.remainingCredits } : prev);

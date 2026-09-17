@@ -37,7 +37,8 @@ import {
   BookOpen,
   Receipt,
   Home,
-  ArrowLeft
+  ArrowLeft,
+  Trash2
 } from 'lucide-react';
 import { 
   Reseller, 
@@ -85,6 +86,8 @@ import {
 } from '../utils/invoiceManager';
 import { DealerBusinessCardModal } from './DealerBusinessCardModal';
 import { DigitalInvoiceModal } from './DigitalInvoiceModal';
+import { ScanResult } from '../types';
+import { syncUserScansFromFirestore, deleteScanResult, deleteScanRecordsByIds } from '../utils/storage';
 
 interface ResellerDashboardModalProps {
   isOpen: boolean;
@@ -93,7 +96,7 @@ interface ResellerDashboardModalProps {
   onOpenAuthModal?: () => void;
   onOpenBusinessPresentation?: () => void;
   onOpenTechnicalReport?: () => void;
-  initialTab?: 'overview' | 'clients' | 'presentation' | 'packages' | 'share' | 'commissions' | 'invoices' | 'bank' | 'apply';
+  initialTab?: 'overview' | 'clients' | 'scans' | 'presentation' | 'packages' | 'share' | 'commissions' | 'invoices' | 'bank' | 'apply';
 }
 
 export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
@@ -109,7 +112,15 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
   const [commissions, setCommissions] = useState<CommissionTransaction[]>([]);
   const [referredUsers, setReferredUsers] = useState<UserMember[]>([]);
   const [referredUserSearch, setReferredUserSearch] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<'overview' | 'clients' | 'presentation' | 'packages' | 'share' | 'commissions' | 'invoices' | 'bank' | 'apply'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'overview' | 'clients' | 'scans' | 'presentation' | 'packages' | 'share' | 'commissions' | 'invoices' | 'bank' | 'apply'>(initialTab);
+
+  // Dealer's own scan history state
+  const [dealerScans, setDealerScans] = useState<ScanResult[]>([]);
+  const [dealerScansLoading, setDealerScansLoading] = useState<boolean>(false);
+  const [dealerScansSearch, setDealerScansSearch] = useState<string>('');
+  const [isDeletingScanId, setIsDeletingScanId] = useState<string | null>(null);
+  const [isClearingDealerScans, setIsClearingDealerScans] = useState<boolean>(false);
+  const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
 
   // Digital Invoices State
   const [invoices, setInvoices] = useState<DigitalInvoice[]>([]);
@@ -196,12 +207,9 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
         }
 
         if (currentSession && isSubscribed) {
-          if (currentUser && (currentUser.uid === currentSession.uid || Boolean(currentUser.email && currentSession.email && currentUser.email.toLowerCase() === currentSession.email.toLowerCase()))) {
-            if (currentUser.creditsBalance !== undefined && currentSession.creditsBalance !== currentUser.creditsBalance) {
-              currentSession = { ...currentSession, creditsBalance: currentUser.creditsBalance };
-              setActiveResellerSession(currentSession);
-            }
-          }
+          // NOTE: The active reseller session is the single source of truth for the balance.
+          // Do NOT overwrite it from currentUser (cached member session may be stale on reload,
+          // which made dealer credits look like they were not decreasing after scans).
           setActiveReseller(currentSession);
           
           // Auto-redirect to packages tab if credits are 0 or negative
@@ -346,6 +354,60 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
       alert(err?.message || 'Sipariş oluşturulamadı.');
     } finally {
       setIsSubmittingOrder(false);
+    }
+  };
+
+  // ---- Dealer's own scan history (load + delete + bulk delete) ----
+  const loadDealerScans = async (silent = false) => {
+    const uid = currentUser?.uid || activeReseller?.uid || '';
+    const email = currentUser?.email || activeReseller?.email || '';
+    if (!uid) return;
+    if (!silent) setDealerScansLoading(true);
+    try {
+      const list = await syncUserScansFromFirestore(uid, email);
+      setDealerScans(list);
+    } catch (e) {
+      console.debug('Load dealer scans notice:', e);
+    } finally {
+      if (!silent) setDealerScansLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    loadDealerScans();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, currentUser?.uid, currentUser?.email]);
+
+  const handleDeleteDealerScan = (id: string) => {
+    const uid = currentUser?.uid || activeReseller?.uid;
+    setIsDeletingScanId(id);
+    try {
+      deleteScanResult(id, uid);
+      setDealerScans(prev => prev.filter(s => s.id !== id));
+      setScanActionMsg('Tarama kaydı kalıcı olarak silindi.');
+      setTimeout(() => setScanActionMsg(null), 3000);
+    } finally {
+      setIsDeletingScanId(null);
+    }
+  };
+
+  const handleClearAllDealerScans = async () => {
+    if (dealerScans.length === 0) return;
+    const uid = currentUser?.uid || activeReseller?.uid;
+    const ok = window.confirm(`Tüm tarama kayıtlarınız (toplam ${dealerScans.length} adet) kalıcı olarak silinecek. Bu işlem geri alınamaz! Emin misiniz?`);
+    if (!ok) return;
+    setIsClearingDealerScans(true);
+    try {
+      await deleteScanRecordsByIds(dealerScans.map(s => s.id), uid);
+      setDealerScans([]);
+      setScanActionMsg(`Toplam ${dealerScans.length} tarama kaydı başarıyla silindi.`);
+      setTimeout(() => setScanActionMsg(null), 4000);
+    } catch (e) {
+      console.error('Bulk delete dealer scans error:', e);
+      alert('Tarama kayıtları silinirken bir hata oluştu.');
+    } finally {
+      setIsClearingDealerScans(false);
     }
   };
 
@@ -782,6 +844,21 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                 <span>Danışanlarım & Üyelerim</span>
                 <span className="px-1.5 py-0.2 bg-emerald-900 text-emerald-200 border border-emerald-500/40 rounded-full text-[10px] font-mono font-bold">
                   {referredUsers.length}
+                </span>
+              </button>
+
+              <button
+                onClick={() => setActiveTab('scans')}
+                className={`px-4 py-2 rounded-xl transition-all flex items-center gap-1.5 cursor-pointer ${
+                  activeTab === 'scans'
+                    ? 'bg-gradient-to-r from-rose-600 to-orange-600 text-white shadow-md'
+                    : 'text-rose-400 hover:text-rose-200 bg-rose-950/40 border border-rose-500/30'
+                }`}
+              >
+                <Clock className="w-3.5 h-3.5" />
+                <span>Tarama Geçmişim</span>
+                <span className="px-1.5 py-0.2 bg-rose-950 text-rose-300 border border-rose-500/40 rounded-full text-[10px] font-mono font-bold">
+                  {dealerScans.length}
                 </span>
               </button>
 
@@ -1251,6 +1328,146 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
             )}
 
             {/* TAB: İŞ SUNUM RAPORU & DİJİTAL KATALOG */}
+            {activeTab === 'scans' && (
+              <div className="space-y-4">
+                {/* Header + Actions */}
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-11 h-11 rounded-2xl bg-rose-500/20 border border-rose-500/50 text-rose-400 flex items-center justify-center shrink-0 shadow-lg shadow-rose-950/60">
+                      <Clock className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-extrabold text-slate-100 uppercase tracking-wider">Tarama Geçmişim</h3>
+                      <p className="text-[11px] text-slate-400">
+                        Kendi panelinizde yapılan tüm tarama kayıtları. Silme işlemi kalıcıdır ve Firestore veritabanından kaldırır.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={() => loadDealerScans()}
+                      disabled={dealerScansLoading}
+                      className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${dealerScansLoading ? 'animate-spin' : ''}`} />
+                      <span>Yenile</span>
+                    </button>
+                    <button
+                      onClick={handleClearAllDealerScans}
+                      disabled={dealerScans.length === 0 || isClearingDealerScans}
+                      className={`px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                        dealerScans.length > 0
+                          ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-md shadow-rose-950/60'
+                          : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      }`}
+                    >
+                      {isClearingDealerScans ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                      <span>Tüm Geçmişi Sil ({dealerScans.length})</span>
+                    </button>
+                  </div>
+                </div>
+
+                {scanActionMsg && (
+                  <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold">
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span>{scanActionMsg}</span>
+                  </div>
+                )}
+
+                {/* Search */}
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    value={dealerScansSearch}
+                    onChange={(e) => setDealerScansSearch(e.target.value)}
+                    placeholder="Tarih, tarama tipi veya frekans arayın..."
+                    className="w-full pl-9 pr-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs text-slate-200 outline-none focus:border-rose-500 placeholder:text-slate-600"
+                  />
+                </div>
+
+                {/* Records */}
+                {dealerScansLoading && dealerScans.length === 0 ? (
+                  <div className="flex items-center justify-center gap-3 p-10 text-slate-400 text-xs">
+                    <Loader2 className="w-4 h-4 animate-spin text-rose-400" />
+                    <span>Tarama kayıtlarınız yükleniyor...</span>
+                  </div>
+                ) : dealerScans.length === 0 ? (
+                  <div className="p-10 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-2xl">
+                    Henüz hiç tarama kaydınız bulunmuyor. Yaptığınız taramalar burada anlık olarak görünecektir.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-2xl border border-slate-800">
+                    <table className="w-full text-left text-xs text-slate-300">
+                      <thead className="bg-slate-900/90 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800 sticky top-0">
+                        <tr>
+                          <th className="p-3">Tarih / Saat</th>
+                          <th className="p-3">Tarama Türü</th>
+                          <th className="p-3">Frekans</th>
+                          <th className="p-3">Enerji</th>
+                          <th className="p-3">Durum</th>
+                          <th className="p-3 text-right">İşlem</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800">
+                        {dealerScans
+                          .filter(s => {
+                            const q = dealerScansSearch.trim().toLowerCase();
+                            if (!q) return true;
+                            return (
+                              (s.treatmentName || s.targetName || s.targetType || '').toString().toLowerCase().includes(q) ||
+                              String(s.frequencyHz || '').includes(q) ||
+                              new Date(s.timestamp).toLocaleString('tr-TR').toLowerCase().includes(q)
+                            );
+                          })
+                          .map(s => (
+                            <tr key={s.id} className="hover:bg-slate-900/60 transition-colors">
+                              <td className="p-3 text-[11px] text-slate-400 whitespace-nowrap font-mono">
+                                {new Date(s.timestamp).toLocaleString('tr-TR', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                              </td>
+                              <td className="p-3">
+                                <span className="px-2 py-0.5 rounded-md text-[10px] font-bold border bg-cyan-500/20 text-cyan-300 border-cyan-500/30">
+                                  {(s.treatmentName || s.targetName || s.targetType || 'Biyo-Aura Tarama')}
+                                </span>
+                              </td>
+                              <td className="p-3 font-mono text-[11px] text-amber-300">
+                                {s.frequencyHz ? `${s.frequencyHz} Hz` : '-'}
+                              </td>
+                              <td className="p-3 font-mono text-[11px]">
+                                <span className="text-emerald-300">{s.bioEnergyLevel}%</span>
+                              </td>
+                              <td className="p-3">
+                                <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${s.isAfterTreatment ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-cyan-600/20 text-cyan-300 border-cyan-500/30'}`}>
+                                  {s.isAfterTreatment ? 'Tedavi Sonrası' : 'Tarama'}
+                                </span>
+                              </td>
+                              <td className="p-3 text-right">
+                                <button
+                                  onClick={() => handleDeleteDealerScan(s.id)}
+                                  disabled={isDeletingScanId === s.id}
+                                  className="p-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/30 text-rose-400 hover:text-rose-200 transition-colors cursor-pointer disabled:opacity-40"
+                                  title="Bu tarama kaydını sil"
+                                >
+                                  {isDeletingScanId === s.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                    {dealerScans.filter(s => {
+                      const q = dealerScansSearch.trim().toLowerCase();
+                      if (!q) return true;
+                      return (s.treatmentName || s.targetName || s.targetType || '').toString().toLowerCase().includes(q) || String(s.frequencyHz || '').includes(q) || new Date(s.timestamp).toLocaleString('tr-TR').toLowerCase().includes(q);
+                    }).length === 0 && (
+                      <div className="p-6 text-center text-xs text-slate-500">Arama sonucu bulunamadı.</div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {activeTab === 'presentation' && (
               <div className="space-y-6 animate-fade-in">
                 {/* Header Banner */}

@@ -1,6 +1,6 @@
 import { ScanResult } from '../types';
 import { db } from '../lib/firebase';
-import { doc, setDoc, deleteDoc, collection, getDocs, limit, query, where } from 'firebase/firestore';
+import { doc, setDoc, deleteDoc, collection, getDocs, limit, query, onSnapshot, Unsubscribe } from 'firebase/firestore';
 
 const STORAGE_KEY_SCANS = 'aurabio_scan_history_v1';
 const USER_SCANS_PREFIX = 'aurabio_user_scans_';
@@ -459,5 +459,97 @@ export function getLastPreScan(): ScanResult | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * ADMIN: Fetch the full scan history across all members/dealers from Firestore (`scan_records`).
+ */
+export async function getAllScanRecordsAdmin(): Promise<ScanResult[]> {
+  const deletedIds = getDeletedScanIds('global');
+  try {
+    const scansCol = collection(db, 'scan_records');
+    const snap = await getDocs(scansCol);
+    const list: ScanResult[] = [];
+    snap.forEach((docSnap) => {
+      const data = docSnap.data() as ScanResult;
+      if (data && data.id && !deletedIds.has(data.id)) {
+        list.push({ ...data, id: docSnap.id });
+      }
+    });
+    list.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
+    return list;
+  } catch (err) {
+    console.debug('Fetch all scan records notice:', err);
+    return getScanHistory();
+  }
+}
+
+/**
+ * ADMIN: Real-time live subscription to the whole `scan_records` collection
+ * (new scans appear instantly in the admin history panel without refreshing).
+ */
+export function subscribeToScanRecords(onList: (list: ScanResult[]) => void): Unsubscribe {
+  try {
+    const scansCol = collection(db, 'scan_records');
+    const unsub = onSnapshot(scansCol, (snap) => {
+      const list: ScanResult[] = [];
+      const deletedIds = getDeletedScanIds('global');
+      snap.forEach((docSnap) => {
+        const data = docSnap.data() as ScanResult;
+        if (data && data.id && !deletedIds.has(data.id)) {
+          list.push({ ...data, id: docSnap.id });
+        }
+      });
+      list.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
+      onList(list);
+    });
+    return unsub;
+  } catch (err) {
+    console.debug('Subscribe scan records notice:', err);
+    return () => {};
+  }
+}
+
+/**
+ * ADMIN: Bulk-delete a set of scan records from Firestore + all local storages.
+ */
+export async function deleteScanRecordsByIds(ids: string[], userUid?: string): Promise<number> {
+  let deleted = 0;
+  for (const id of ids) {
+    deleteScanResult(id, userUid);
+    deleted++;
+  }
+  return deleted;
+}
+
+/**
+ * ADMIN: Clear EVERY scan record in the system (whole `scan_records` Firestore collection).
+ */
+export async function clearAllScanRecords(): Promise<number> {
+  let deleted = 0;
+  try {
+    const scansCol = collection(db, 'scan_records');
+    const snap = await getDocs(scansCol);
+    const ids = snap.docs.map(d => d.id);
+    // Delete in bounded parallel batches to avoid overwhelming the connection
+    const BATCH = 50;
+    for (let i = 0; i < ids.length; i += BATCH) {
+      const chunk = ids.slice(i, i + BATCH);
+      await Promise.all(chunk.map(async (id) => {
+        try {
+          await deleteDoc(doc(db, 'scan_records', id));
+          markScanAsDeleted(id, 'global');
+          deleted++;
+        } catch (err) {
+          console.debug('Delete scan record notice:', err);
+        }
+      }));
+    }
+  } catch (err) {
+    console.debug('Clear all scan records Firestore notice:', err);
+  }
+  localStorage.removeItem(STORAGE_KEY_SCANS);
+  window.dispatchEvent(new CustomEvent('aurabio_scans_updated'));
+  return deleted;
 }
 

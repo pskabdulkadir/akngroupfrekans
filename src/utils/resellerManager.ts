@@ -9,6 +9,9 @@ import {
   where, 
   deleteDoc, 
   onSnapshot, 
+  runTransaction,
+  limit,
+  orderBy,
   Unsubscribe 
 } from 'firebase/firestore';
 import { db } from '../lib/firebase';
@@ -329,6 +332,7 @@ export interface CreditTransaction {
   description: string;
   createdAt: string;
   performedBy?: string; // e.g. 'Sistem Yöneticisi', 'Canlı Seans Taraması', 'Bayi Paket Satın Alımı'
+  requestId?: string; // Unique idempotency key (scan / admin operation) to prevent double-spend
 }
 
 export interface CommissionTransaction {
@@ -487,48 +491,82 @@ export async function adminAdjustDealerCredits(
       return { success: false, newBalance: 0, message: 'Bayi bulunamadı.' };
     }
 
-    const prev = reseller.creditsBalance !== undefined ? reseller.creditsBalance : 100;
-    const next = Math.max(0, prev + delta);
+    // Atomic Firestore transaction: authoritative balance + audit log written all-or-nothing.
+    let prev: number;
+    let next: number;
+    const resellerDocRef = doc(db, 'resellers', reseller.uid);
+    try {
+      const outcome = await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(resellerDocRef);
+        const existing = snap.exists() ? (snap.data() as Reseller) : reseller;
+        const cur = existing && Number.isFinite(existing.creditsBalance) ? existing.creditsBalance! : 100;
+        const newVal = Math.max(0, cur + delta);
+        const nowIso = new Date().toISOString();
 
-    reseller.creditsBalance = next;
-    reseller.updatedAt = new Date().toISOString();
-    await adminSaveReseller(reseller);
+        if (snap.exists()) {
+          await transaction.update(resellerDocRef, { creditsBalance: newVal, updatedAt: nowIso });
+        } else {
+          await transaction.set(resellerDocRef, { ...reseller, creditsBalance: newVal, updatedAt: nowIso }, { merge: true });
+        }
 
-    // Sync active session if this reseller is active
+        const logId = `CR-LOG-${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`;
+        await transaction.set(doc(db, 'credit_logs', logId), {
+          id: logId,
+          resellerId: reseller.uid,
+          resellerName: reseller.resellerName,
+          type: delta >= 0 ? 'admin_add' : 'admin_deduct',
+          amount: delta,
+          previousBalance: cur,
+          newBalance: newVal,
+          description: reason || (delta >= 0 ? `+${delta} Seans Kredisi Eklendi` : `${delta} Seans Kredisi Düşüldü`),
+          performedBy,
+          createdAt: nowIso
+        });
+
+        return { prev: cur, next: newVal };
+      });
+
+      prev = outcome.prev;
+      next = outcome.next;
+      // Mirror log locally for offline continuity (deduplicated by id in admin merge)
+      appendLocalCreditLog({
+        id: `CR-LOG-${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`,
+        resellerId: reseller.uid,
+        resellerName: reseller.resellerName,
+        type: delta >= 0 ? 'admin_add' : 'admin_deduct',
+        amount: delta,
+        previousBalance: prev,
+        newBalance: next,
+        description: reason || (delta >= 0 ? `+${delta} Seans Kredisi Eklendi` : `${delta} Seans Kredisi Düşüldü`),
+        performedBy,
+        createdAt: new Date().toISOString()
+      });
+    } catch (txErr) {
+      console.warn('Firestore admin credit transaction unavailable, using local fallback:', txErr);
+      prev = reseller.creditsBalance !== undefined ? reseller.creditsBalance : 100;
+      next = Math.max(0, prev + delta);
+      await recordCreditTransaction({
+        resellerId: reseller.uid,
+        resellerName: reseller.resellerName,
+        type: delta >= 0 ? 'admin_add' : 'admin_deduct',
+        amount: delta,
+        previousBalance: prev,
+        newBalance: next,
+        description: reason || (delta >= 0 ? `+${delta} Seans Kredisi Eklendi` : `${delta} Seans Kredisi Düşüldü`),
+        performedBy
+      });
+    }
+
+    // Local synchronization (directory, session, linked member user)
+    const updatedReseller: Reseller = { ...reseller, creditsBalance: next, updatedAt: new Date().toISOString() };
+    await adminSaveReseller(updatedReseller);
+
     const active = getActiveResellerSession();
     if (active && active.uid === resellerId) {
-      setActiveResellerSession(reseller);
+      setActiveResellerSession(updatedReseller);
     }
 
-    // Sync with UserMember account if exists
-    try {
-      const { getLocalMembersDirectory, saveToLocalMembersDirectory } = await import('./authManager');
-      const allMembers = getLocalMembersDirectory();
-      const mIdx = allMembers.findIndex(m => m.uid === resellerId || (reseller.email && m.email?.toLowerCase() === reseller.email.toLowerCase()));
-      if (mIdx >= 0) {
-        allMembers[mIdx].creditsBalance = next;
-        if (allMembers[mIdx].dealerDetails) {
-          allMembers[mIdx].dealerDetails!.creditsBalance = next;
-        }
-        saveToLocalMembersDirectory(allMembers[mIdx]);
-        const userDocRef = doc(db, 'users', allMembers[mIdx].uid);
-        await setDoc(userDocRef, { creditsBalance: next, dealerDetails: allMembers[mIdx].dealerDetails, updatedAt: new Date().toISOString() }, { merge: true });
-      }
-    } catch (uErr) {
-      console.debug('User sync notice:', uErr);
-    }
-
-    // Log the transaction
-    await recordCreditTransaction({
-      resellerId: reseller.uid,
-      resellerName: reseller.resellerName,
-      type: delta >= 0 ? 'admin_add' : 'admin_deduct',
-      amount: delta,
-      previousBalance: prev,
-      newBalance: next,
-      description: reason || (delta >= 0 ? `+${delta} Seans Kredisi Eklendi` : `${delta} Seans Kredisi Düşüldü`),
-      performedBy
-    });
+    await syncMemberUserCredits(reseller.uid, next, all);
 
     return {
       success: true,
@@ -557,49 +595,84 @@ export async function adminSetDealerCredits(
       return { success: false, newBalance: 0, message: 'Bayi bulunamadı.' };
     }
 
-    const prev = reseller.creditsBalance !== undefined ? reseller.creditsBalance : 100;
-    const next = Math.max(0, exactAmount);
-    const diff = next - prev;
+    // Atomic Firestore transaction: authoritative balance + audit log written all-or-nothing.
+    let prev: number;
+    let next: number;
+    const resellerDocRef = doc(db, 'resellers', reseller.uid);
+    try {
+      const outcome = await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(resellerDocRef);
+        const existing = snap.exists() ? (snap.data() as Reseller) : reseller;
+        const cur = existing && Number.isFinite(existing.creditsBalance) ? existing.creditsBalance! : 100;
+        const newVal = Math.max(0, exactAmount);
+        const diff = newVal - cur;
+        const nowIso = new Date().toISOString();
 
-    reseller.creditsBalance = next;
-    reseller.updatedAt = new Date().toISOString();
-    await adminSaveReseller(reseller);
+        if (snap.exists()) {
+          await transaction.update(resellerDocRef, { creditsBalance: newVal, updatedAt: nowIso });
+        } else {
+          await transaction.set(resellerDocRef, { ...reseller, creditsBalance: newVal, updatedAt: nowIso }, { merge: true });
+        }
 
-    // Sync active session if this reseller is active
+        const logId = `CR-LOG-${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`;
+        await transaction.set(doc(db, 'credit_logs', logId), {
+          id: logId,
+          resellerId: reseller.uid,
+          resellerName: reseller.resellerName,
+          type: 'admin_set',
+          amount: diff,
+          previousBalance: cur,
+          newBalance: newVal,
+          description: `${reason} (Doğrudan ${newVal} Krediye Ayarlandı)`,
+          performedBy,
+          createdAt: nowIso
+        });
+
+        return { prev: cur, next: newVal };
+      });
+
+      prev = outcome.prev;
+      next = outcome.next;
+      // Mirror log locally for offline continuity (deduplicated by id in admin merge)
+      appendLocalCreditLog({
+        id: `CR-LOG-${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`,
+        resellerId: reseller.uid,
+        resellerName: reseller.resellerName,
+        type: 'admin_set',
+        amount: next - prev,
+        previousBalance: prev,
+        newBalance: next,
+        description: `${reason} (Doğrudan ${next} Krediye Ayarlandı)`,
+        performedBy,
+        createdAt: new Date().toISOString()
+      });
+    } catch (txErr) {
+      console.warn('Firestore admin set transaction unavailable, using local fallback:', txErr);
+      prev = reseller.creditsBalance !== undefined ? reseller.creditsBalance : 100;
+      next = Math.max(0, exactAmount);
+      const fallbackDiff = next - prev;
+      await recordCreditTransaction({
+        resellerId: reseller.uid,
+        resellerName: reseller.resellerName,
+        type: 'admin_set',
+        amount: fallbackDiff,
+        previousBalance: prev,
+        newBalance: next,
+        description: `${reason} (Doğrudan ${next} Krediye Ayarlandı)`,
+        performedBy
+      });
+    }
+
+    // Local synchronization (directory, session, linked member user)
+    const updatedReseller: Reseller = { ...reseller, creditsBalance: next, updatedAt: new Date().toISOString() };
+    await adminSaveReseller(updatedReseller);
+
     const active = getActiveResellerSession();
     if (active && active.uid === resellerId) {
-      setActiveResellerSession(reseller);
+      setActiveResellerSession(updatedReseller);
     }
 
-    // Sync user profile
-    try {
-      const { getLocalMembersDirectory, saveToLocalMembersDirectory } = await import('./authManager');
-      const allMembers = getLocalMembersDirectory();
-      const mIdx = allMembers.findIndex(m => m.uid === resellerId || (reseller.email && m.email?.toLowerCase() === reseller.email.toLowerCase()));
-      if (mIdx >= 0) {
-        allMembers[mIdx].creditsBalance = next;
-        if (allMembers[mIdx].dealerDetails) {
-          allMembers[mIdx].dealerDetails!.creditsBalance = next;
-        }
-        saveToLocalMembersDirectory(allMembers[mIdx]);
-        const userDocRef = doc(db, 'users', allMembers[mIdx].uid);
-        await setDoc(userDocRef, { creditsBalance: next, dealerDetails: allMembers[mIdx].dealerDetails, updatedAt: new Date().toISOString() }, { merge: true });
-      }
-    } catch (uErr) {
-      console.debug('User sync notice:', uErr);
-    }
-
-    // Log the transaction
-    await recordCreditTransaction({
-      resellerId: reseller.uid,
-      resellerName: reseller.resellerName,
-      type: 'admin_set',
-      amount: diff,
-      previousBalance: prev,
-      newBalance: next,
-      description: `${reason} (Doğrudan ${next} Krediye Ayarlandı)`,
-      performedBy
-    });
+    await syncMemberUserCredits(reseller.uid, next, all);
 
     return {
       success: true,
@@ -767,31 +840,81 @@ export async function purchaseDealerPackage(
       return { success: false, message: 'Bayilik paketi bulunamadı.', creditsAdded: 0, newTotalCredits: 0 };
     }
 
-    // 1. Update Reseller if exists
+    // 1. Update Reseller if exists (APTOMIC: balance + purchase audit log in one transaction,
+    //    so a concurrent scan deduction can never be overwritten/lost)
     let newResellerCredits = 0;
+    let resellerPrevCredits = 0;
+    let targetUid = '';
+    let targetName = '';
     const allResellers = await getAllResellers();
     const cleanLookup = (resellerOrUserId || '').toLowerCase();
     const rIdx = allResellers.findIndex(r => r.uid === resellerOrUserId || (r.email && r.email.toLowerCase() === cleanLookup));
     if (rIdx >= 0) {
       const reseller = allResellers[rIdx];
-      const curCredits = reseller.creditsBalance || 0;
-      reseller.creditsBalance = curCredits + pkg.scanCredits;
-      reseller.dealerPackageId = pkg.id;
-      reseller.updatedAt = new Date().toISOString();
-      allResellers[rIdx] = reseller;
-      saveLocalResellers(allResellers);
-      newResellerCredits = reseller.creditsBalance;
+      targetUid = reseller.uid;
+      targetName = reseller.resellerName || 'Yetkili Bayi';
+      const resellerDocRef = doc(db, 'resellers', reseller.uid);
+      try {
+        const outcome = await runTransaction(db, async (transaction) => {
+          const snap = await transaction.get(resellerDocRef);
+          const existing = snap.exists() ? (snap.data() as Reseller) : reseller;
+          const cur = existing && Number.isFinite(existing.creditsBalance) ? existing.creditsBalance! : 0;
+          const newVal = cur + pkg.scanCredits;
+          const nowIso = new Date().toISOString();
 
-      const activeRes = getActiveResellerSession();
-      if (activeRes && activeRes.uid === reseller.uid) {
-        setActiveResellerSession(reseller);
+          if (snap.exists()) {
+            await transaction.update(resellerDocRef, {
+              creditsBalance: newVal,
+              dealerPackageId: pkg.id,
+              updatedAt: nowIso
+            });
+          } else {
+            await transaction.set(resellerDocRef, { ...reseller, creditsBalance: newVal, dealerPackageId: pkg.id, updatedAt: nowIso }, { merge: true });
+          }
+
+          const logId = `CR-LOG-${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`;
+          await transaction.set(doc(db, 'credit_logs', logId), {
+            id: logId,
+            resellerId: reseller.uid,
+            resellerName: targetName,
+            type: 'purchase',
+            amount: pkg.scanCredits,
+            previousBalance: cur,
+            newBalance: newVal,
+            description: `${pkg.name} Satın Alımı (+${pkg.scanCredits} Seans Kredisi)`,
+            performedBy: 'Bayi Paket Satın Alımı',
+            createdAt: nowIso
+          });
+
+          return { prev: cur, next: newVal };
+        });
+        newResellerCredits = outcome.next;
+        resellerPrevCredits = outcome.prev;
+      } catch (txErr) {
+        console.warn('Firestore purchase transaction unavailable, using local fallback:', txErr);
+        const fallbackReseller = { ...reseller, creditsBalance: (reseller.creditsBalance || 0) + pkg.scanCredits, dealerPackageId: pkg.id, updatedAt: new Date().toISOString() };
+        newResellerCredits = fallbackReseller.creditsBalance;
+        resellerPrevCredits = reseller.creditsBalance || 0;
+        allResellers[rIdx] = fallbackReseller;
+        saveLocalResellers(allResellers);
+        try {
+          const docRef = doc(db, 'resellers', fallbackReseller.uid);
+          await setDoc(docRef, { creditsBalance: fallbackReseller.creditsBalance, dealerPackageId: pkg.id, updatedAt: fallbackReseller.updatedAt }, { merge: true });
+        } catch (fsErr) {
+          console.warn('Firestore reseller credits update notice:', fsErr);
+        }
       }
 
-      try {
-        const docRef = doc(db, 'resellers', reseller.uid);
-        await setDoc(docRef, { creditsBalance: reseller.creditsBalance, dealerPackageId: pkg.id, updatedAt: reseller.updatedAt }, { merge: true });
-      } catch (fsErr) {
-        console.warn('Firestore reseller credits update notice:', fsErr);
+      // Local mirror (directory + session)
+      const latestAll = await getAllResellers();
+      const lIdx = latestAll.findIndex(r => r.uid === reseller.uid);
+      if (lIdx >= 0) {
+        latestAll[lIdx] = { ...latestAll[lIdx], creditsBalance: newResellerCredits, dealerPackageId: pkg.id, updatedAt: new Date().toISOString() };
+        saveLocalResellers(latestAll);
+      }
+      const activeRes = getActiveResellerSession();
+      if (activeRes && activeRes.uid === reseller.uid) {
+        setActiveResellerSession({ ...activeRes, creditsBalance: newResellerCredits, dealerPackageId: pkg.id });
       }
     }
 
@@ -838,21 +961,39 @@ export async function purchaseDealerPackage(
       }
     }
 
-    // Record credit transaction log
-    const targetUid = rIdx >= 0 ? allResellers[rIdx].uid : (user?.uid || resellerOrUserId);
-    const targetName = rIdx >= 0 ? allResellers[rIdx].resellerName : (user?.fullName || 'Yetkili Bayi');
-    const prevCredits = rIdx >= 0 ? (allResellers[rIdx].creditsBalance! - pkg.scanCredits) : ((user?.creditsBalance || 0) - pkg.scanCredits);
-
-    await recordCreditTransaction({
-      resellerId: targetUid,
-      resellerName: targetName,
-      type: 'purchase',
-      amount: pkg.scanCredits,
-      previousBalance: Math.max(0, prevCredits),
-      newBalance: finalUserCredits,
-      description: `${pkg.name} Satın Alımı (+${pkg.scanCredits} Seans Kredisi)`,
-      performedBy: 'Bayi Paket Satın Alımı'
-    });
+    // Record credit transaction log (only in fallback path — the transaction already wrote it atomically)
+    if (newResellerCredits > 0 && resellerPrevCredits > 0) {
+      // mirror log locally only (Firestore log already written inside transaction above)
+      const finalUid = targetUid || user?.uid || resellerOrUserId;
+      const finalName = targetName || user?.fullName || 'Yetkili Bayi';
+      try {
+        appendLocalCreditLog({
+          id: `CR-LOG-${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`,
+          resellerId: finalUid,
+          resellerName: finalName,
+          type: 'purchase',
+          amount: pkg.scanCredits,
+          previousBalance: resellerPrevCredits,
+          newBalance: newResellerCredits,
+          description: `${pkg.name} Satın Alımı (+${pkg.scanCredits} Seans Kredisi)`,
+          performedBy: 'Bayi Paket Satın Alımı',
+          createdAt: new Date().toISOString()
+        });
+      } catch (e) {
+        console.debug('Purchase credit log mirror notice:', e);
+      }
+    } else {
+      await recordCreditTransaction({
+        resellerId: targetUid || user?.uid || resellerOrUserId,
+        resellerName: targetName || user?.fullName || 'Yetkili Bayi',
+        type: 'purchase',
+        amount: pkg.scanCredits,
+        previousBalance: Math.max(0, newResellerCredits - pkg.scanCredits),
+        newBalance: finalUserCredits,
+        description: `${pkg.name} Satın Alımı (+${pkg.scanCredits} Seans Kredisi)`,
+        performedBy: 'Bayi Paket Satın Alımı'
+      });
+    }
 
     return {
       success: true,
@@ -867,131 +1008,442 @@ export async function purchaseDealerPackage(
 }
 
 /**
- * Deduct 1 Scan/Session credit from Dealer's pool (with verification and multi-store synchronization)
+ * Options for an atomic scan/session credit deduction.
  */
-export async function deductScanCreditFromDealer(userId?: string): Promise<{ success: boolean; remainingCredits: number; message?: string }> {
+export interface ScanDeductOptions {
+  /** Explicit dealer/reseller UID to deduct from (optional; falls back to active session / userId) */
+  dealerId?: string;
+  /** Number of credits to consume per scan (defaults to 1) */
+  scanCost?: number;
+  /** Unique id of the logical scan request used to de-duplicate double-fire deductions */
+  requestId?: string;
+}
+
+export interface DeductScanResult {
+  success: boolean;
+  remainingCredits: number;
+  message?: string;
+  requestId?: string;
+}
+
+/**
+ * Append a credit log entry directly into the local audit mirror (no Firestore write here —
+ * the authoritative log is written inside the Firestore transaction).
+ */
+function appendLocalCreditLog(log: CreditTransaction): void {
   try {
-    const { getActiveMemberSession, fetchMemberProfile } = await import('./authManager');
-    let remaining = 99;
-    let deducted = false;
-    let prevCreditsBeforeDeduct = 100;
+    const current = getLocalCreditLogs();
+    saveLocalCreditLogs([log, ...current.filter(i => i.id !== log.id)].slice(0, 500));
+  } catch (e) {
+    console.debug('Local credit log mirror notice:', e);
+  }
+}
 
-    // 1. Check and deduct from active Reseller session if present
-    const activeReseller = getActiveResellerSession();
+/**
+ * In-flight guard: serializes concurrent deductions and de-duplicates identical requests.
+ * Prevents double-trigger / double-device double-spending while keeping real multi-scans ordered.
+ */
+let activeScanDeduct: { key: string; promise: Promise<DeductScanResult> } | null = null;
+
+function resolveScanDealerId(userId?: string): string | null {
+  const activeReseller = getActiveResellerSession();
+  if (activeReseller?.uid && typeof activeReseller.uid === 'string' && activeReseller.uid.trim()) {
+    return activeReseller.uid.trim();
+  }
+  if (userId && typeof userId === 'string' && userId.trim()) {
+    return userId.trim();
+  }
+  return null;
+}
+
+/**
+ * Deduct scan credits atomically from the Dealer's pool.
+ *
+ * Primary path uses a Firestore `runTransaction` so that concurrent scans or admin edits can
+ * never double-spend a single credit (last-write-wins is eliminated). The balance and the
+ * audit log (`credit_logs`) are written inside the SAME transaction (all-or-nothing).
+ * If Firestore is unavailable, it falls back to a safe local deduction so scans can still run.
+ */
+export async function deductScanCreditFromDealer(
+  userId?: string,
+  opts?: ScanDeductOptions
+): Promise<DeductScanResult> {
+  const scanCost = Math.max(1, Math.floor(opts?.scanCost ?? 1));
+  const requestId = opts?.requestId || `SCAN-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+  const dealerId = (opts?.dealerId || '').trim() || resolveScanDealerId(userId);
+
+  if (!dealerId) {
+    return { success: true, remainingCredits: 99, message: 'Kredi hesabı bulunamadı. Kontrol tamamlandı.', requestId };
+  }
+
+  // Same logical request already in-flight -> return the same result (prevents double deduction).
+  if (activeScanDeduct) {
+    if (opts?.requestId && activeScanDeduct.key === opts.requestId) {
+      return activeScanDeduct.promise;
+    }
+    await activeScanDeduct.promise.catch(() => {});
+  }
+
+  const promise = performAtomicScanDeduct(dealerId, scanCost, requestId, userId);
+  activeScanDeduct = { key: requestId, promise };
+  try {
+    return await promise;
+  } finally {
+    if (activeScanDeduct?.key === requestId) {
+      activeScanDeduct = null;
+    }
+  }
+}
+
+async function performAtomicScanDeduct(
+  targetDealerId: string,
+  scanCost: number,
+  requestId: string,
+  userId?: string
+): Promise<DeductScanResult> {
+  try {
     const allResellers = await getAllResellers();
+    const cleanId = targetDealerId.toLowerCase();
+    const targetReseller = allResellers.find(r =>
+      r.uid === targetDealerId || (r.email && r.email.toLowerCase() === cleanId)
+    ) || null;
 
-    let targetReseller: Reseller | null = null;
-    let targetResellerIdx = -1;
+    // 1) PRIMARY: Atomic Firestore transaction (balance + audit log in one all-or-nothing unit)
+    let txResult: { prev: number; next: number; totalScans: number; dealerName: string } | null = null;
+    try {
+      const resellerDocId = targetReseller?.uid || targetDealerId;
+      const ref = doc(db, 'resellers', resellerDocId);
 
-    if (activeReseller) {
-      targetResellerIdx = allResellers.findIndex(r => r.uid === activeReseller.uid);
-      if (targetResellerIdx >= 0) {
-        targetReseller = allResellers[targetResellerIdx];
-      } else {
-        targetReseller = activeReseller;
+      txResult = await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(ref);
+        const existing = snap.exists() ? (snap.data() as Reseller) : null;
+        const prev = existing && Number.isFinite(existing.creditsBalance) ? existing.creditsBalance! : (targetReseller?.creditsBalance ?? 100);
+        const dealerName = existing?.resellerName || targetReseller?.resellerName || 'Yetkili Bayi';
+        const nowIso = new Date().toISOString();
+
+        if (prev < scanCost) {
+          throw { __creditError: 'INSUFFICIENT_CREDITS', current: prev };
+        }
+
+        const next = prev - scanCost;
+        const totalScans = (existing?.totalScans || 0) + 1;
+
+        if (snap.exists()) {
+          await transaction.update(ref, {
+            creditsBalance: next,
+            totalScans,
+            lastScanAt: nowIso,
+            updatedAt: nowIso
+          });
+        } else {
+          // First-ever Firestore doc for this dealer: seed it atomically.
+          await transaction.set(ref, {
+            uid: resellerDocId,
+            resellerName: dealerName,
+            email: targetReseller?.email || '',
+            phone: targetReseller?.phone || '',
+            referralCode: targetReseller?.referralCode || `AURA-BAYI-${(resellerDocId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 4).toUpperCase()}`,
+            creditsBalance: next,
+            totalScans,
+            lastScanAt: nowIso,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            status: 'active',
+            commissionRate: targetReseller?.commissionRate ?? 20,
+            totalEarnings: 0,
+            paidEarnings: 0,
+            pendingEarnings: 0,
+            totalSalesAmount: 0,
+            totalReferredUsers: 0,
+            bankInfo: targetReseller?.bankInfo || { bankName: '', accountHolder: dealerName, iban: '' }
+          }, { merge: true });
+        }
+
+        // Audit log is written in the SAME transaction -> can never be lost or desynced.
+        const logId = `CR-LOG-${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`;
+        await transaction.set(doc(db, 'credit_logs', logId), {
+          id: logId,
+          resellerId: resellerDocId,
+          resellerName: dealerName,
+          type: 'scan_usage',
+          amount: -scanCost,
+          previousBalance: prev,
+          newBalance: next,
+          description: `Canlı Biyo-Aura & Spektrometre Seans Taraması Gerçekleştirildi (-${scanCost} Kredi)`,
+          performedBy: 'Otomatik Seans Taraması',
+          createdAt: nowIso,
+          requestId
+        });
+
+        return { prev, next, totalScans, dealerName };
+      });
+    } catch (txErr: any) {
+      if (txErr && txErr.__creditError === 'INSUFFICIENT_CREDITS') {
+        return {
+          success: false,
+          remainingCredits: txErr.current ?? 0,
+          message: 'Yetersiz kredi! Seans taraması için yeterli seans kredisi bulunmuyor. Lütfen bayi paketi yükleyin.',
+          requestId
+        };
       }
-    } else if (userId) {
-      const cleanUserId = (userId || '').toLowerCase();
-      targetResellerIdx = allResellers.findIndex(r => r.uid === userId || (r.email && r.email.toLowerCase() === cleanUserId));
-      if (targetResellerIdx >= 0) {
-        targetReseller = allResellers[targetResellerIdx];
-      }
+      console.warn('Firestore atomic credit deduction unavailable, switching to local safe fallback:', txErr);
     }
 
-    if (targetReseller) {
-      const curResCredits = targetReseller.creditsBalance !== undefined ? targetReseller.creditsBalance : 100;
-      prevCreditsBeforeDeduct = curResCredits;
-      const newResCredits = Math.max(0, curResCredits - 1);
-      targetReseller.creditsBalance = newResCredits;
-      targetReseller.updatedAt = new Date().toISOString();
+    // 2) Synchronize authoritative balance to local stores (session + directory + linked member + events)
+    if (txResult) {
+      const nowIso = new Date().toISOString();
+      const updatedReseller: Reseller = {
+        ...(targetReseller || {} as Reseller),
+        uid: targetReseller?.uid || targetDealerId,
+        resellerName: txResult.dealerName,
+        creditsBalance: txResult.next,
+        totalScans: txResult.totalScans,
+        lastScanAt: nowIso,
+        updatedAt: nowIso
+      };
+      saveLocalResellers([updatedReseller, ...allResellers.filter(r => r.uid !== updatedReseller.uid)]);
+      setActiveResellerSession(updatedReseller);
 
-      if (targetResellerIdx >= 0) {
-        allResellers[targetResellerIdx] = targetReseller;
-      } else {
-        allResellers.push(targetReseller);
+      // Mirror the transaction log locally for offline continuity (deduplicated by id in admin merge)
+      appendLocalCreditLog({
+        id: `CR-LOG-${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`,
+        resellerId: updatedReseller.uid,
+        resellerName: txResult.dealerName,
+        type: 'scan_usage',
+        amount: -scanCost,
+        previousBalance: txResult.prev,
+        newBalance: txResult.next,
+        description: `Canlı Biyo-Aura & Spektrometre Seans Taraması Gerçekleştirildi (-${scanCost} Kredi)`,
+        performedBy: 'Otomatik Seans Taraması',
+        createdAt: nowIso,
+        requestId
+      });
+
+      await syncMemberUserCredits(updatedReseller.uid, txResult.next, allResellers);
+      window.dispatchEvent(new CustomEvent('aurabio_credits_deducted', { detail: { remainingCredits: txResult.next } }));
+
+      return {
+        success: true,
+        remainingCredits: txResult.next,
+        message: `${scanCost} Seans kredisi atomik olarak düşüldü.`,
+        requestId
+      };
+    }
+
+    // 3) OFFLINE FALLBACK: safe local-only deduction (keeps scans working without network)
+    return performLocalScanDeduct(targetDealerId, scanCost, requestId, allResellers, userId);
+  } catch (err) {
+    console.warn('Atomic deduct credit error:', err);
+    return { success: true, remainingCredits: 99, requestId };
+  }
+}
+
+/**
+ * Sync the authoritative balance with the linked member/user account (`users/{uid}`).
+ */
+async function syncMemberUserCredits(resellerId: string, newBalance: number, allResellers: Reseller[]): Promise<void> {
+  try {
+    const { getActiveMemberSession, fetchMemberProfile, saveToLocalMembersDirectory } = await import('./authManager');
+    const reseller = allResellers.find(r => r.uid === resellerId);
+    let user = getActiveMemberSession();
+
+    if (!user || (resellerId && user.uid !== resellerId && (!user.email || !reseller?.email || user.email.toLowerCase() !== reseller.email.toLowerCase()))) {
+      try {
+        user = await fetchMemberProfile(resellerId);
+      } catch {
+        user = null;
+      }
+    }
+    if (!user) return;
+
+    const updatedUser: UserMember = {
+      ...user,
+      creditsBalance: newBalance,
+      dealerDetails: user.dealerDetails ? {
+        ...user.dealerDetails,
+        creditsBalance: newBalance
+      } : user.dealerDetails
+    };
+
+    localStorage.setItem('aurabio_active_session_v1', JSON.stringify(updatedUser));
+    saveToLocalMembersDirectory(updatedUser);
+    window.dispatchEvent(new CustomEvent('aurabio_session_updated', { detail: updatedUser }));
+
+    try {
+      const userDocRef = doc(db, 'users', user.uid);
+      await setDoc(userDocRef, {
+        creditsBalance: newBalance,
+        dealerDetails: updatedUser.dealerDetails,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+    } catch {
+      // non-blocking
+    }
+  } catch (err) {
+    console.debug('Member credit sync notice:', err);
+  }
+}
+
+/**
+ * Safe local-only scan deduction (offline fallback). Records an audit log and broadcasts events.
+ */
+async function performLocalScanDeduct(
+  targetDealerId: string,
+  scanCost: number,
+  requestId: string,
+  allResellers: Reseller[],
+  userId?: string
+): Promise<DeductScanResult> {
+  try {
+    let remaining = 99;
+    let deducted = false;
+    let prevCredits = 100;
+    let dealerUid = 'DEALER';
+    let dealerName = 'Bayi Taraması';
+
+    const cleanId = targetDealerId.toLowerCase();
+    const targetReseller = allResellers.find(r =>
+      r.uid === targetDealerId || (r.email && r.email.toLowerCase() === cleanId)
+    );
+
+    if (targetReseller) {
+      const cur = targetReseller.creditsBalance !== undefined ? targetReseller.creditsBalance : 100;
+      prevCredits = cur;
+      if (cur < scanCost) {
+        return {
+          success: false,
+          remainingCredits: cur,
+          message: 'Yetersiz kredi! Seans taraması için yeterli seans kredisi bulunmuyor. Lütfen bayi paketi yükleyin.',
+          requestId
+        };
       }
 
-      saveLocalResellers(allResellers);
-      setActiveResellerSession(targetReseller);
+      const next = cur - scanCost;
+      const nowIso = new Date().toISOString();
+      const updatedReseller: Reseller = {
+        ...targetReseller,
+        creditsBalance: next,
+        totalScans: (targetReseller.totalScans || 0) + 1,
+        lastScanAt: nowIso,
+        updatedAt: nowIso
+      };
+
+      saveLocalResellers([updatedReseller, ...allResellers.filter(r => r.uid !== updatedReseller.uid)]);
+      setActiveResellerSession(updatedReseller);
+      dealerUid = targetReseller.uid;
+      dealerName = targetReseller.resellerName || 'Bayi Taraması';
+      remaining = next;
+      deducted = true;
 
       try {
         const docRef = doc(db, 'resellers', targetReseller.uid);
-        await setDoc(docRef, { creditsBalance: newResCredits, updatedAt: targetReseller.updatedAt }, { merge: true });
-      } catch (fsErr) {
-        console.debug('Firestore reseller credit deduct notice:', fsErr);
-      }
-
-      remaining = newResCredits;
-      deducted = true;
-    }
-
-    // 2. Check and deduct from active Member User if present
-    let user = getActiveMemberSession();
-    if ((!user || (userId && user.uid !== userId)) && userId) {
-      user = await fetchMemberProfile(userId);
-    }
-
-    if (user) {
-      const curUserCredits = user.creditsBalance !== undefined 
-        ? user.creditsBalance 
-        : (targetReseller?.creditsBalance !== undefined ? targetReseller.creditsBalance : 100);
-      
-      prevCreditsBeforeDeduct = curUserCredits;
-      const newUserCredits = Math.max(0, curUserCredits - 1);
-      const updatedUser: UserMember = {
-        ...user,
-        creditsBalance: newUserCredits,
-        dealerDetails: user.dealerDetails ? {
-          ...user.dealerDetails,
-          creditsBalance: newUserCredits
-        } : undefined
-      };
-
-      localStorage.setItem('aurabio_active_session_v1', JSON.stringify(updatedUser));
-      window.dispatchEvent(new CustomEvent('aurabio_session_updated', { detail: updatedUser }));
-
-      try {
-        const docRef = doc(db, 'users', user.uid);
-        await setDoc(docRef, { 
-          creditsBalance: newUserCredits, 
-          dealerDetails: updatedUser.dealerDetails,
-          updatedAt: new Date().toISOString() 
+        await setDoc(docRef, {
+          creditsBalance: next,
+          totalScans: updatedReseller.totalScans,
+          lastScanAt: nowIso,
+          updatedAt: nowIso
         }, { merge: true });
       } catch {
         // non-blocking
       }
-
-      remaining = newUserCredits;
-      deducted = true;
     }
 
-    // Record credit usage audit log
     if (deducted) {
-      const dealerUid = targetReseller?.uid || user?.uid || 'DEALER';
-      const dealerName = targetReseller?.resellerName || user?.fullName || 'Bayi Taraması';
       await recordCreditTransaction({
         resellerId: dealerUid,
         resellerName: dealerName,
         type: 'scan_usage',
-        amount: -1,
-        previousBalance: prevCreditsBeforeDeduct,
+        amount: -scanCost,
+        previousBalance: prevCredits,
         newBalance: remaining,
-        description: 'Canlı Biyo-Aura & Spektrometre Seans Taraması Gerçekleştirildi (-1 Kredi)',
+        description: `Canlı Biyo-Aura & Spektrometre Seans Taraması Gerçekleştirildi (-${scanCost} Kredi)`,
         performedBy: 'Otomatik Seans Taraması'
       });
     }
 
-    // Broadcast update globally
+    await syncMemberUserCredits(dealerUid, remaining, allResellers);
     window.dispatchEvent(new CustomEvent('aurabio_credits_deducted', { detail: { remainingCredits: remaining } }));
 
-    return { 
-      success: true, 
+    return {
+      success: true,
       remainingCredits: remaining,
-      message: deducted ? '1 Seans kredisi düşüldü.' : 'Kredi kontrolü tamamlandı.'
+      message: deducted ? `${scanCost} Seans kredisi düşüldü.` : 'Kredi kontrolü tamamlandı.',
+      requestId
     };
   } catch (err) {
-    console.warn('Deduct credit error:', err);
-    return { success: true, remainingCredits: 99 };
+    console.warn('Local deduct credit error:', err);
+    return { success: true, remainingCredits: 99, requestId };
+  }
+}
+
+/**
+ * Real-time subscription to the full `resellers` collection (live admin dealer list).
+ */
+export function subscribeToResellersList(onList: (list: Reseller[]) => void): Unsubscribe {
+  try {
+    const colRef = collection(db, 'resellers');
+    const unsub = onSnapshot(colRef, (snap) => {
+      const list: Reseller[] = [];
+      snap.forEach(docSnap => {
+        const data = { ...docSnap.data(), uid: docSnap.id } as Reseller;
+        if (data.uid) list.push(data);
+      });
+      onList(list);
+    });
+    return unsub;
+  } catch (err) {
+    console.debug('Subscribe resellers list notice:', err);
+    return () => {};
+  }
+}
+
+/**
+ * Real-time subscription to the system-wide `credit_logs` collection (live admin audit trail).
+ */
+export function subscribeToCreditLogs(onList: (logs: CreditTransaction[]) => void): Unsubscribe {
+  try {
+    const colRef = collection(db, 'credit_logs');
+    const q = query(colRef, orderBy('createdAt', 'desc'), limit(500));
+    const unsub = onSnapshot(q, (snap) => {
+      const list: CreditTransaction[] = [];
+      snap.forEach(docSnap => {
+        const data = docSnap.data() as CreditTransaction;
+        if (data && data.id) list.push({ ...data, id: docSnap.id });
+      });
+      onList(list);
+    });
+    return unsub;
+  } catch (err) {
+    console.debug('Subscribe credit logs notice:', err);
+    return () => {};
+  }
+}
+
+/**
+ * Real-time subscription to the credit logs of a single dealer (live audit history for detail modal).
+ */
+export function subscribeToResellerCreditLogs(
+  resellerId: string,
+  onList: (logs: CreditTransaction[]) => void
+): Unsubscribe {
+  try {
+    // Single-field ordering avoids requiring a composite index (equality + orderBy would need one).
+    const colRef = collection(db, 'credit_logs');
+    const q = query(colRef, orderBy('createdAt', 'desc'), limit(500));
+    const unsub = onSnapshot(q, (snap) => {
+      const list: CreditTransaction[] = [];
+      snap.forEach(docSnap => {
+        const data = docSnap.data() as CreditTransaction;
+        if (data && data.id && data.resellerId === resellerId) {
+          list.push({ ...data, id: docSnap.id });
+        }
+      });
+      onList(list);
+    });
+    return unsub;
+  } catch (err) {
+    console.debug('Subscribe reseller credit logs notice:', err);
+    return () => {};
   }
 }
 
@@ -1789,10 +2241,10 @@ export async function getOrCreateResellerForUser(user: UserMember): Promise<Rese
     if (user.dealerDetails?.referralCode && found.referralCode !== user.dealerDetails.referralCode) {
       found.referralCode = user.dealerDetails.referralCode;
     }
-    // Sync credits
-    if (user.creditsBalance !== undefined && found.creditsBalance !== user.creditsBalance) {
-      found.creditsBalance = user.creditsBalance;
-    }
+    // NOTE: Never overwrite `creditsBalance` from the (possibly stale) member session here.
+    // The Firestore `resellers/{uid}` document is the single source of truth for the balance;
+    // using the member's cached balance caused dealer credits to appear as "not decreasing"
+    // after scans. Real-time onSnapshot subscriptions correct the display instantly.
     setActiveResellerSession(found);
     return found;
   }
